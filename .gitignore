@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+config.json
+results/
+test_results/
+smoke_results/
+smoke_60s/
+event_images/
+*.pt
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.jpg
+*.jpeg
+*.png

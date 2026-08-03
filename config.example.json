@@ -1,0 +1,23 @@
+{
+  "source_dir": "",
+  "output_dir": "results",
+  "model": "yolo26s.pt",
+  "tracker": "bytetrack.yaml",
+  "device": "0",
+  "confidence": 0.22,
+  "iou": 0.65,
+  "image_size": 960,
+  "speed_factor": 3.0,
+  "vehicle_classes": [2, 3, 5, 7],
+  "roi_polygon": [[410, 470], [1260, 430], [1270, 900], [650, 870], [400, 670]],
+  "counting_line": [[790, 790], [1035, 545]],
+  "increasing_x_direction": "유출",
+  "deadband_px": 8,
+  "min_stable_frames": 3,
+  "min_horizontal_motion_px": 12,
+  "line_margin_px": 40,
+  "save_event_images": true,
+  "save_review_video": false,
+  "review_width": 640,
+  "review_stride": 3
+}
