@@ -25,6 +25,96 @@ class DirectionCounterTests(unittest.TestCase):
         self.assertIsNone(counter.update(3, (40, 150)))
         self.assertIsNone(counter.update(3, (60, 150)))
 
+    def test_recovers_id_switch_across_counting_line(self):
+        counter = DirectionCounter(
+            [[50, 0], [50, 100]],
+            deadband_px=1,
+            min_stable_frames=2,
+            min_horizontal_motion_px=5,
+            id_stitch_max_gap=10,
+            id_stitch_max_distance_px=50,
+            id_stitch_line_distance_px=80,
+        )
+        counter.update_frame([(1, (30, 50), 2)], 0)
+        counter.update_frame([(1, (36, 50), 2)], 1)
+        counter.update_frame([(1, (43, 50), 2)], 2)
+
+        first_new_frame = counter.update_frame([(9, (55, 50), 2)], 5)
+        self.assertEqual(counter.last_recoveries, {9: 1})
+        self.assertEqual(first_new_frame, {})
+        self.assertEqual(counter.update_frame([(9, (63, 50), 2)], 6), {9: "유출"})
+
+    def test_does_not_stitch_vehicle_moving_in_opposite_direction(self):
+        counter = DirectionCounter(
+            [[50, 0], [50, 100]],
+            deadband_px=1,
+            min_stable_frames=2,
+            min_horizontal_motion_px=5,
+            id_stitch_max_gap=10,
+            id_stitch_max_distance_px=80,
+            id_stitch_line_distance_px=100,
+        )
+        counter.update_frame([(1, (30, 50), 2)], 0)
+        counter.update_frame([(1, (38, 50), 2)], 1)
+        counter.update_frame([(9, (20, 50), 2)], 3)
+        self.assertEqual(counter.last_recoveries, {})
+        self.assertIn(1, counter.states)
+        self.assertIn(9, counter.states)
+
+    def test_matches_simultaneous_new_ids_one_to_one_by_position(self):
+        counter = DirectionCounter(
+            [[50, 0], [50, 100]],
+            deadband_px=1,
+            min_stable_frames=1,
+            min_horizontal_motion_px=5,
+            id_stitch_max_gap=10,
+            id_stitch_max_distance_px=80,
+            id_stitch_line_distance_px=100,
+        )
+        counter.update_frame([(1, (30, 25), 2), (2, (30, 75), 2)], 0)
+        counter.update_frame([(1, (38, 25), 2), (2, (38, 75), 2)], 1)
+        counter.update_frame([(10, (55, 73), 2), (11, (55, 27), 2)], 3)
+        self.assertEqual(counter.last_recoveries, {10: 2, 11: 1})
+        self.assertEqual(set(counter.states), {10, 11})
+
+    def test_does_not_stitch_different_vehicle_classes(self):
+        counter = DirectionCounter(
+            [[50, 0], [50, 100]],
+            min_stable_frames=1,
+            id_stitch_max_gap=10,
+            id_stitch_max_distance_px=80,
+            id_stitch_line_distance_px=100,
+        )
+        counter.update_frame([(1, (40, 50), 2)], 0)
+        counter.update_frame([(9, (55, 50), 7)], 2)
+        self.assertEqual(counter.last_recoveries, {})
+
+    def test_does_not_attach_a_new_vehicle_to_an_already_counted_track(self):
+        counter = DirectionCounter(
+            [[50, 0], [50, 100]],
+            deadband_px=1,
+            min_stable_frames=1,
+            min_horizontal_motion_px=5,
+            id_stitch_max_gap=10,
+            id_stitch_max_distance_px=80,
+            id_stitch_line_distance_px=100,
+        )
+        counter.update_frame([(1, (35, 50), 2)], 0)
+        self.assertEqual(counter.update_frame([(1, (60, 50), 2)], 1), {1: "유출"})
+        counter.update_frame([(9, (58, 50), 2)], 2)
+        self.assertEqual(counter.last_recoveries, {})
+
+    def test_prunes_tracks_older_than_stitch_window(self):
+        counter = DirectionCounter(
+            [[50, 0], [50, 100]],
+            min_stable_frames=1,
+            id_stitch_max_gap=2,
+        )
+        counter.update_frame([(1, (40, 50), 2)], 0)
+        counter.update_frame([], 3)
+        self.assertNotIn(1, counter.states)
+        self.assertIn(1, counter.retired_ids)
+
 
 class UtilityTests(unittest.TestCase):
     def test_video_start_and_slot_labels(self):

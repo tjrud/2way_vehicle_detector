@@ -22,6 +22,9 @@ class TrackState:
     candidate_frames: int = 0
     anchor_point: tuple[float, float] | None = None
     last_point: tuple[float, float] | None = None
+    velocity: tuple[float, float] = (0.0, 0.0)
+    last_frame: int = -1
+    class_id: int | None = None
     counted: bool = False
 
 
@@ -57,6 +60,11 @@ class DirectionCounter:
         min_horizontal_motion_px: float = 12.0,
         line_margin_px: float = 35.0,
         increasing_x_direction: str = "유출",
+        id_stitch_enabled: bool = True,
+        id_stitch_max_gap: int = 90,
+        id_stitch_max_distance_px: float = 140.0,
+        id_stitch_line_distance_px: float = 160.0,
+        id_stitch_direction_tolerance_px: float = 12.0,
     ) -> None:
         if len(line) != 2:
             raise ValueError("counting_line must contain exactly two points")
@@ -70,7 +78,15 @@ class DirectionCounter:
         self.min_horizontal_motion_px = min_horizontal_motion_px
         self.line_margin_ratio = line_margin_px / self.length
         self.increasing_x_direction = increasing_x_direction
+        self.id_stitch_enabled = id_stitch_enabled
+        self.id_stitch_max_gap = max(1, id_stitch_max_gap)
+        self.id_stitch_max_distance_px = max(1.0, id_stitch_max_distance_px)
+        self.id_stitch_line_distance_px = max(1.0, id_stitch_line_distance_px)
+        self.id_stitch_direction_tolerance_px = max(0.0, id_stitch_direction_tolerance_px)
         self.states: dict[int, TrackState] = {}
+        self.retired_ids: set[int] = set()
+        self.recovered_ids: dict[int, int] = {}
+        self.last_recoveries: dict[int, int] = {}
 
     def signed_distance(self, point: tuple[float, float]) -> float:
         ax, ay = self.a
@@ -91,9 +107,128 @@ class DirectionCounter:
         dx, dy = bx - ax, by - ay
         return ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)
 
-    def update(self, track_id: int, point: tuple[float, float]) -> str | None:
-        state = self.states.setdefault(track_id, TrackState())
+    def _remember_observation(
+        self,
+        state: TrackState,
+        point: tuple[float, float],
+        frame_index: int | None,
+        class_id: int | None,
+    ) -> None:
+        if state.last_point is not None:
+            frame_gap = 1
+            if frame_index is not None and state.last_frame >= 0:
+                frame_gap = max(1, frame_index - state.last_frame)
+            state.velocity = (
+                (point[0] - state.last_point[0]) / frame_gap,
+                (point[1] - state.last_point[1]) / frame_gap,
+            )
         state.last_point = point
+        if frame_index is not None:
+            state.last_frame = frame_index
+        if class_id is not None:
+            state.class_id = class_id
+
+    def _stitch_score(
+        self,
+        state: TrackState,
+        point: tuple[float, float],
+        class_id: int,
+        frame_index: int,
+    ) -> float | None:
+        if state.last_point is None or state.last_frame < 0:
+            return None
+        if state.counted or state.stable_side == 0:
+            return None
+        gap = frame_index - state.last_frame
+        if gap <= 0 or gap > self.id_stitch_max_gap:
+            return None
+        if state.class_id is not None and state.class_id != class_id:
+            return None
+        if abs(self.signed_distance(state.last_point)) > self.id_stitch_line_distance_px:
+            return None
+        if abs(self.signed_distance(point)) > self.id_stitch_line_distance_px:
+            return None
+        margin = self.line_margin_ratio * 1.5
+        if not -margin <= self.projection_ratio(state.last_point) <= 1 + margin:
+            return None
+        if not -margin <= self.projection_ratio(point) <= 1 + margin:
+            return None
+
+        displacement_x = point[0] - state.last_point[0]
+        velocity_x = state.velocity[0]
+        tolerance = self.id_stitch_direction_tolerance_px
+        if velocity_x > 0.5 and displacement_x < -tolerance:
+            return None
+        if velocity_x < -0.5 and displacement_x > tolerance:
+            return None
+
+        predicted = (
+            state.last_point[0] + state.velocity[0] * gap,
+            state.last_point[1] + state.velocity[1] * gap,
+        )
+        distance = math.dist(predicted, point)
+        allowed_distance = self.id_stitch_max_distance_px + min(gap, 30) * 2.0
+        if distance > allowed_distance:
+            return None
+        return distance + gap * 0.35
+
+    def update_frame(
+        self,
+        observations: list[tuple[int, tuple[float, float], int]],
+        frame_index: int,
+    ) -> dict[int, str]:
+        """Update a complete frame and reconnect IDs split by a short occlusion."""
+        self.last_recoveries = {}
+        stale_ids = [
+            track_id
+            for track_id, state in self.states.items()
+            if state.last_frame >= 0 and frame_index - state.last_frame > self.id_stitch_max_gap
+        ]
+        for track_id in stale_ids:
+            self.states.pop(track_id, None)
+            self.retired_ids.add(track_id)
+        active_ids = {track_id for track_id, _, _ in observations}
+        if self.id_stitch_enabled:
+            new_observations = [item for item in observations if item[0] not in self.states and item[0] not in self.retired_ids]
+            candidates: list[tuple[float, int, int]] = []
+            for new_id, point, class_id in new_observations:
+                for old_id, state in self.states.items():
+                    if old_id in active_ids:
+                        continue
+                    score = self._stitch_score(state, point, class_id, frame_index)
+                    if score is not None:
+                        candidates.append((score, old_id, new_id))
+
+            matched_old: set[int] = set()
+            matched_new: set[int] = set()
+            for _, old_id, new_id in sorted(candidates):
+                if old_id in matched_old or new_id in matched_new or old_id not in self.states:
+                    continue
+                self.states[new_id] = self.states.pop(old_id)
+                self.retired_ids.add(old_id)
+                self.recovered_ids[new_id] = old_id
+                self.last_recoveries[new_id] = old_id
+                matched_old.add(old_id)
+                matched_new.add(new_id)
+
+        directions: dict[int, str] = {}
+        for track_id, point, class_id in observations:
+            direction = self.update(track_id, point, frame_index=frame_index, class_id=class_id)
+            if direction is not None:
+                directions[track_id] = direction
+        return directions
+
+    def update(
+        self,
+        track_id: int,
+        point: tuple[float, float],
+        frame_index: int | None = None,
+        class_id: int | None = None,
+    ) -> str | None:
+        if track_id in self.retired_ids:
+            return None
+        state = self.states.setdefault(track_id, TrackState())
+        self._remember_observation(state, point, frame_index, class_id)
         if state.counted:
             return None
 
@@ -146,7 +281,7 @@ def default_config(source_dir: str) -> dict:
         "source_dir": source_dir,
         "output_dir": "results",
         "model": "yolo26s.pt",
-        "tracker": "bytetrack.yaml",
+        "tracker": "botsort_reid.yaml",
         "device": "0",
         "confidence": 0.22,
         "iou": 0.65,
@@ -160,6 +295,11 @@ def default_config(source_dir: str) -> dict:
         "min_stable_frames": 3,
         "min_horizontal_motion_px": 12,
         "line_margin_px": 40,
+        "id_stitch_enabled": True,
+        "id_stitch_max_gap": 90,
+        "id_stitch_max_distance_px": 140,
+        "id_stitch_line_distance_px": 160,
+        "id_stitch_direction_tolerance_px": 12,
         "save_event_images": True,
         "save_review_video": False,
         "review_width": 640,
@@ -278,6 +418,11 @@ class BatchAnalyzer:
         device = requested_device if requested_device == "cpu" or torch.cuda.is_available() else "cpu"
         self.log(f"모델 불러오는 중: {self.config['model']} / 장치: {device}")
         model = YOLO(self.config["model"])
+        tracker_config = str(self.config.get("tracker", "botsort_reid.yaml"))
+        tracker_path = Path(tracker_config)
+        if not tracker_path.is_absolute() and (self.config_dir / tracker_path).exists():
+            tracker_config = str(self.config_dir / tracker_path)
+        self.log(f"추적기: {tracker_config}")
         counts = {slot: {"유입": 0, "유출": 0} for slot in range(96)}
         events: list[CountEvent] = []
         total_frames = 0
@@ -310,6 +455,11 @@ class BatchAnalyzer:
                 min_horizontal_motion_px=float(self.config.get("min_horizontal_motion_px", 12)),
                 line_margin_px=float(self.config.get("line_margin_px", 40)),
                 increasing_x_direction=self.config.get("increasing_x_direction", "유출"),
+                id_stitch_enabled=bool(self.config.get("id_stitch_enabled", True)),
+                id_stitch_max_gap=int(self.config.get("id_stitch_max_gap", 90)),
+                id_stitch_max_distance_px=float(self.config.get("id_stitch_max_distance_px", 140)),
+                id_stitch_line_distance_px=float(self.config.get("id_stitch_line_distance_px", 160)),
+                id_stitch_direction_tolerance_px=float(self.config.get("id_stitch_direction_tolerance_px", 12)),
             )
             start_seconds = video_start_seconds(video.name)
             cap = cv2.VideoCapture(str(video))
@@ -335,7 +485,7 @@ class BatchAnalyzer:
                 result = model.track(
                     masked,
                     persist=True,
-                    tracker=self.config.get("tracker", "bytetrack.yaml"),
+                    tracker=tracker_config,
                     conf=float(self.config.get("confidence", 0.22)),
                     iou=float(self.config.get("iou", 0.65)),
                     imgsz=int(self.config.get("image_size", 960)),
@@ -351,12 +501,23 @@ class BatchAnalyzer:
                     track_ids = boxes.id.int().cpu().tolist()
                     class_ids = boxes.cls.int().cpu().tolist()
                     confidences = boxes.conf.cpu().tolist()
+                    track_details: list[tuple[int, tuple[float, float], int, float, tuple[float, float, float, float]]] = []
                     for xyxy, track_id, class_id, confidence in zip(coordinates, track_ids, class_ids, confidences):
                         x1, y1, x2, y2 = map(float, xyxy)
                         point = ((x1 + x2) / 2, y2)
                         if not point_in_polygon(point, self.config["roi_polygon"]):
                             continue
-                        direction = direction_counter.update(track_id, point)
+                        track_details.append((track_id, point, class_id, float(confidence), (x1, y1, x2, y2)))
+
+                    directions = direction_counter.update_frame(
+                        [(track_id, point, class_id) for track_id, point, class_id, _, _ in track_details],
+                        frame_index,
+                    )
+                    for new_id, old_id in direction_counter.last_recoveries.items():
+                        self.log(f"  가림 ID 연결: {old_id} → {new_id}")
+
+                    for track_id, point, class_id, confidence, (x1, y1, x2, y2) in track_details:
+                        direction = directions.get(track_id)
                         color = (255, 160, 40) if direction == "유입" else (40, 130, 255)
                         if writer is not None:
                             cv2.rectangle(annotated, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
@@ -377,7 +538,7 @@ class BatchAnalyzer:
                             track_id=track_id,
                             class_id=class_id,
                             class_name=CLASS_LABELS.get(class_id, str(class_id)),
-                            confidence=float(confidence),
+                            confidence=confidence,
                             point_x=point[0],
                             point_y=point[1],
                         )
