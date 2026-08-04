@@ -358,7 +358,7 @@ def default_config(source_dir: str) -> dict:
     return {
         "source_dir": source_dir,
         "output_dir": "results",
-        "model": "yolo26s.pt",
+        "model": "yolo26l.pt",
         "tracker": "botsort_reid.yaml",
         "device": "0",
         "confidence": 0.22,
