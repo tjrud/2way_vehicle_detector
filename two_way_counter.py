@@ -83,6 +83,7 @@ class TrackState:
     stable_side: int = 0
     candidate_side: int = 0
     candidate_frames: int = 0
+    candidate_min_normal_speed: float = 0.0
     anchor_point: tuple[float, float] | None = None
     last_point: tuple[float, float] | None = None
     velocity: tuple[float, float] = (0.0, 0.0)
@@ -128,6 +129,9 @@ class DirectionCounter:
         id_stitch_max_distance_px: float = 140.0,
         id_stitch_line_distance_px: float = 160.0,
         id_stitch_direction_tolerance_px: float = 12.0,
+        fast_crossing_enabled: bool = True,
+        fast_crossing_min_normal_speed_px: float = 15.0,
+        fast_crossing_stable_frames: int = 2,
     ) -> None:
         if len(line) != 2:
             raise ValueError("counting_line must contain exactly two points")
@@ -146,6 +150,12 @@ class DirectionCounter:
         self.id_stitch_max_distance_px = max(1.0, id_stitch_max_distance_px)
         self.id_stitch_line_distance_px = max(1.0, id_stitch_line_distance_px)
         self.id_stitch_direction_tolerance_px = max(0.0, id_stitch_direction_tolerance_px)
+        self.fast_crossing_enabled = fast_crossing_enabled
+        self.fast_crossing_min_normal_speed_px = max(0.0, fast_crossing_min_normal_speed_px)
+        self.fast_crossing_stable_frames = min(
+            self.min_stable_frames,
+            max(1, fast_crossing_stable_frames),
+        )
         self.states: dict[int, TrackState] = {}
         self.retired_ids: set[int] = set()
         self.recovered_ids: dict[int, int] = {}
@@ -169,6 +179,13 @@ class DirectionCounter:
         px, py = point
         dx, dy = bx - ax, by - ay
         return ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)
+
+    def normal_velocity(self, state: TrackState) -> float:
+        """Return signed motion perpendicular to the counting line in pixels per frame."""
+        dx = self.b[0] - self.a[0]
+        dy = self.b[1] - self.a[1]
+        vx, vy = state.velocity
+        return (dx * vy - dy * vx) / self.length
 
     def _remember_observation(
         self,
@@ -247,6 +264,7 @@ class DirectionCounter:
         state.anchor_point = state.last_point
         state.candidate_side = 0
         state.candidate_frames = 0
+        state.candidate_min_normal_speed = 0.0
 
     def update_frame(
         self,
@@ -325,21 +343,32 @@ class DirectionCounter:
                 state.anchor_point = point
                 state.candidate_side = 0
                 state.candidate_frames = 0
+                state.candidate_min_normal_speed = 0.0
             return None
 
         if current_side == state.stable_side:
             state.anchor_point = point
             state.candidate_side = 0
             state.candidate_frames = 0
+            state.candidate_min_normal_speed = 0.0
             return None
 
+        moving_away_speed = self.normal_velocity(state) * current_side
         if current_side == state.candidate_side:
             state.candidate_frames += 1
+            state.candidate_min_normal_speed = min(state.candidate_min_normal_speed, moving_away_speed)
         else:
             state.candidate_side = current_side
             state.candidate_frames = 1
+            state.candidate_min_normal_speed = moving_away_speed
 
-        if state.candidate_frames < self.min_stable_frames or state.anchor_point is None:
+        required_frames = self.min_stable_frames
+        if (
+            self.fast_crossing_enabled
+            and state.candidate_min_normal_speed >= self.fast_crossing_min_normal_speed_px
+        ):
+            required_frames = self.fast_crossing_stable_frames
+        if state.candidate_frames < required_frames or state.anchor_point is None:
             return None
         if not -self.line_margin_ratio <= self.projection_ratio(point) <= 1 + self.line_margin_ratio:
             return None
@@ -384,6 +413,9 @@ def default_config(source_dir: str) -> dict:
         "id_stitch_max_distance_px": 140,
         "id_stitch_line_distance_px": 160,
         "id_stitch_direction_tolerance_px": 12,
+        "fast_crossing_enabled": True,
+        "fast_crossing_min_normal_speed_px": 15,
+        "fast_crossing_stable_frames": 2,
         "save_event_images": True,
         "save_review_video": False,
         "review_width": 640,
@@ -594,6 +626,11 @@ class BatchAnalyzer:
                 id_stitch_max_distance_px=float(self.config.get("id_stitch_max_distance_px", 140)),
                 id_stitch_line_distance_px=float(self.config.get("id_stitch_line_distance_px", 160)),
                 id_stitch_direction_tolerance_px=float(self.config.get("id_stitch_direction_tolerance_px", 12)),
+                fast_crossing_enabled=bool(self.config.get("fast_crossing_enabled", True)),
+                fast_crossing_min_normal_speed_px=float(
+                    self.config.get("fast_crossing_min_normal_speed_px", 15)
+                ),
+                fast_crossing_stable_frames=int(self.config.get("fast_crossing_stable_frames", 2)),
             )
             start_seconds = video_start_seconds(video.name)
             cap = cv2.VideoCapture(str(video))

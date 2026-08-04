@@ -48,6 +48,7 @@
 - 기본 분석 크기: 960px
 - ROI 실제 크롭: 활성화, 주변 여백 64px (`roi_crop_enabled`, `roi_crop_padding_px`)
 - 영상 디코딩 선행 버퍼: 8프레임 (`frame_prefetch_buffer`)
+- 빠른 차량: 통과선 수직 속도 15px/프레임 이상이면 통과 후 2프레임 확인
 - GPU: `0`을 선택하면 NVIDIA GPU, `cpu`를 선택하면 CPU
 - GPU 초기화에 실패하면 자동으로 CPU로 전환합니다.
 

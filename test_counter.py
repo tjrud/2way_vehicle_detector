@@ -7,6 +7,35 @@ from two_way_counter import CountEvent, DirectionCounter, FramePrefetcher, box_m
 
 
 class DirectionCounterTests(unittest.TestCase):
+    def test_fast_crossing_uses_two_post_line_frames(self):
+        counter = DirectionCounter(
+            [[50, 0], [50, 100]],
+            deadband_px=1,
+            min_stable_frames=3,
+            min_horizontal_motion_px=5,
+            fast_crossing_min_normal_speed_px=10,
+            fast_crossing_stable_frames=2,
+        )
+        for frame, x in enumerate((30, 32, 34)):
+            self.assertIsNone(counter.update(1, (x, 50), frame_index=frame))
+        self.assertIsNone(counter.update(1, (60, 50), frame_index=3))
+        self.assertEqual(counter.update(1, (75, 50), frame_index=4), "유출")
+
+    def test_slow_crossing_still_requires_three_post_line_frames(self):
+        counter = DirectionCounter(
+            [[50, 0], [50, 100]],
+            deadband_px=1,
+            min_stable_frames=3,
+            min_horizontal_motion_px=5,
+            fast_crossing_min_normal_speed_px=10,
+            fast_crossing_stable_frames=2,
+        )
+        for frame, x in enumerate((40, 42, 44)):
+            self.assertIsNone(counter.update(2, (x, 50), frame_index=frame))
+        self.assertIsNone(counter.update(2, (52, 50), frame_index=3))
+        self.assertIsNone(counter.update(2, (55, 50), frame_index=4))
+        self.assertEqual(counter.update(2, (58, 50), frame_index=5), "유출")
+
     def test_counts_left_to_right_as_outgoing(self):
         counter = DirectionCounter([[50, 0], [50, 100]], deadband_px=1, min_stable_frames=2, min_horizontal_motion_px=5)
         points = [(30, 50), (32, 50), (48, 50), (55, 50), (65, 50)]
