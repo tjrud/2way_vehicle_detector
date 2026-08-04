@@ -30,6 +30,7 @@
   "id_stitch_max_distance_px": 140,
   "id_stitch_line_distance_px": 160,
   "id_stitch_direction_tolerance_px": 12,
+  "save_detailed_records": true,
   "save_event_images": true,
   "save_review_video": false,
   "review_width": 640,

@@ -250,6 +250,22 @@ class UtilityTests(unittest.TestCase):
             self.assertTrue(summary.exists())
             self.assertIn("00:00:03", events.read_text(encoding="utf-8-sig"))
 
+    def test_can_skip_detailed_csv_for_each_video(self):
+        counts = {slot: {"유입": 0, "유출": 0} for slot in range(96)}
+        with tempfile.TemporaryDirectory() as directory:
+            summary, events = write_video_results(
+                Path(directory),
+                Path("01_0000-0300_3배속.mp4"),
+                counts,
+                [],
+                save_detailed_records=False,
+            )
+            self.assertTrue(summary.exists())
+            self.assertIsNone(events)
+            self.assertFalse(
+                (Path(directory) / "01_0000-0300_3배속_차량별_통과기록.csv").exists()
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

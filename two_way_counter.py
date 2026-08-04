@@ -423,6 +423,7 @@ def default_config(source_dir: str) -> dict:
         "fast_crossing_enabled": True,
         "fast_crossing_min_normal_speed_px": 15,
         "fast_crossing_stable_frames": 2,
+        "save_detailed_records": True,
         "save_event_images": True,
         "save_review_video": False,
         "review_width": 640,
@@ -542,12 +543,15 @@ def write_video_results(
     video: Path,
     counts: dict[int, dict[str, int]],
     events: Iterable[CountEvent],
-) -> tuple[Path, Path]:
-    """Write the CSV pair for one source video and return their paths."""
+    save_detailed_records: bool = True,
+) -> tuple[Path, Path | None]:
+    """Write one video's summary and optionally its detailed crossing records."""
     summary_path = output_dir / f"{video.stem}_15분_유입유출_집계.csv"
-    events_path = output_dir / f"{video.stem}_차량별_통과기록.csv"
     write_summary(summary_path, counts)
-    write_events(events_path, events)
+    events_path = None
+    if save_detailed_records:
+        events_path = output_dir / f"{video.stem}_차량별_통과기록.csv"
+        write_events(events_path, events)
     return summary_path, events_path
 
 
@@ -566,7 +570,11 @@ class BatchAnalyzer:
         self.progress = progress or (lambda value: None)
         self.stop_event = stop_event or threading.Event()
 
-    def run(self, limit_seconds: float | None = None, video_paths: list[Path] | None = None) -> tuple[Path, Path]:
+    def run(
+        self,
+        limit_seconds: float | None = None,
+        video_paths: list[Path] | None = None,
+    ) -> tuple[Path, Path | None]:
         import cv2
         import numpy as np
         import torch
@@ -596,8 +604,9 @@ class BatchAnalyzer:
         self.log(f"추적기: {tracker_config}")
         counts = {slot: {"유입": 0, "유출": 0} for slot in range(96)}
         events: list[CountEvent] = []
+        save_detailed_records = bool(self.config.get("save_detailed_records", True))
         summary_path = output_dir / "15분_유입유출_집계.csv"
-        events_path = output_dir / "차량별_통과기록.csv"
+        events_path = output_dir / "차량별_통과기록.csv" if save_detailed_records else None
         total_frames = 0
         metadata: list[tuple[Path, int, float]] = []
         for video in videos:
@@ -755,13 +764,14 @@ class BatchAnalyzer:
                             direction=direction,
                             track_id=track_id,
                             class_id=class_id,
-                            class_name="차량",
+                            class_name=CLASS_LABELS.get(class_id, "차량"),
                             confidence=confidence,
                             point_x=point[0],
                             point_y=point[1],
                         )
-                        events.append(event)
-                        video_events.append(event)
+                        if save_detailed_records:
+                            events.append(event)
+                            video_events.append(event)
                         self.log(f"  {event.real_time} {direction} {event.class_name} (ID {track_id})")
                         if self.config.get("save_event_images", True):
                             snapshot = frame.copy()
@@ -790,17 +800,22 @@ class BatchAnalyzer:
                 video,
                 video_counts,
                 video_events,
+                save_detailed_records=save_detailed_records,
             )
             # Refresh the compatible all-video outputs after every completed video.
             write_summary(summary_path, counts)
-            write_events(events_path, events)
-            self.log(
-                f"  영상별 CSV 저장: {video_summary_path.name}, {video_events_path.name}"
-            )
+            if events_path is not None:
+                write_events(events_path, events)
+                self.log(
+                    f"  영상별 CSV 저장: {video_summary_path.name}, {video_events_path.name}"
+                )
+            else:
+                self.log(f"  영상별 집계 CSV 저장: {video_summary_path.name}")
             self.log(f"[{video_index}/{len(videos)}] 완료: {frame_index:,} 프레임")
 
         write_summary(summary_path, counts)
-        write_events(events_path, events)
+        if events_path is not None:
+            write_events(events_path, events)
         self.progress(1.0 if not self.stop_event.is_set() else processed_frames / max(total_frames, 1))
         self.log(f"완료: 유입 {sum(item['유입'] for item in counts.values()):,}대 / 유출 {sum(item['유출'] for item in counts.values()):,}대")
         return summary_path, events_path

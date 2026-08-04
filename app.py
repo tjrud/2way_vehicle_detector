@@ -33,6 +33,9 @@ class CounterApp(tk.Tk):
         self.model_var = tk.StringVar(value=self.config_data.get("model", "yolo26s.pt"))
         self.device_var = tk.StringVar(value=self.config_data.get("device", "0"))
         self.conf_var = tk.StringVar(value=str(self.config_data.get("confidence", 0.22)))
+        self.detailed_records_var = tk.BooleanVar(
+            value=self.config_data.get("save_detailed_records", True)
+        )
         self.event_images_var = tk.BooleanVar(value=self.config_data.get("save_event_images", True))
         self.review_video_var = tk.BooleanVar(value=self.config_data.get("save_review_video", False))
         self.progress_var = tk.DoubleVar(value=0)
@@ -83,6 +86,11 @@ class CounterApp(tk.Tk):
 
         options = ttk.Frame(setup, style="Card.TFrame")
         options.grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(
+            options,
+            text="출입 시각·차종 상세 CSV 저장",
+            variable=self.detailed_records_var,
+        ).pack(side="left", padx=(0, 18))
         ttk.Checkbutton(options, text="통과 순간 이미지 저장", variable=self.event_images_var).pack(side="left", padx=(0, 18))
         ttk.Checkbutton(options, text="검수용 전체 영상 저장 (용량 큼)", variable=self.review_video_var).pack(side="left")
 
@@ -132,6 +140,7 @@ class CounterApp(tk.Tk):
         config["model"] = self.model_var.get().strip() or "yolo26s.pt"
         config["device"] = self.device_var.get()
         config["confidence"] = float(self.conf_var.get())
+        config["save_detailed_records"] = self.detailed_records_var.get()
         config["save_event_images"] = self.event_images_var.get()
         config["save_review_video"] = self.review_video_var.get()
         save_config(CONFIG_PATH, config)
@@ -225,11 +234,14 @@ class CounterApp(tk.Tk):
         self.progress_var.set(percent)
         self.status_var.set(f"{title} 진행 중 · {percent:.1f}%")
 
-    def analysis_done(self, summary: Path, events: Path) -> None:
+    def analysis_done(self, summary: Path, events: Path | None) -> None:
         self.progress_var.set(100)
         self.status_var.set("분석이 완료되었습니다.")
         self.log(f"집계표: {summary}")
-        self.log(f"통과기록: {events}")
+        if events is not None:
+            self.log(f"통과기록: {events}")
+        else:
+            self.log("차량별 상세 기록은 저장하지 않았습니다.")
         messagebox.showinfo("분석 완료", f"결과를 저장했습니다.\n\n{summary.parent}")
 
     def stop_analysis(self) -> None:
