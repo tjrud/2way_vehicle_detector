@@ -157,8 +157,9 @@ class DirectionCounter:
             max(1, fast_crossing_stable_frames),
         )
         self.states: dict[int, TrackState] = {}
-        self.retired_ids: set[int] = set()
-        self.recovered_ids: dict[int, int] = {}
+        # Keep discarded tracker IDs only during the reconnection guard window.
+        # A permanent set grows for the entire duration of a long analysis.
+        self.retired_ids: dict[int, int] = {}
         self.last_recoveries: dict[int, int] = {}
 
     def signed_distance(self, point: tuple[float, float]) -> float:
@@ -273,6 +274,13 @@ class DirectionCounter:
     ) -> dict[int, str]:
         """Update a complete frame and reconnect IDs split by a short occlusion."""
         self.last_recoveries = {}
+        expired_retired_ids = [
+            track_id
+            for track_id, retired_frame in self.retired_ids.items()
+            if frame_index - retired_frame > self.id_stitch_max_gap
+        ]
+        for track_id in expired_retired_ids:
+            self.retired_ids.pop(track_id, None)
         stale_ids = [
             track_id
             for track_id, state in self.states.items()
@@ -280,7 +288,7 @@ class DirectionCounter:
         ]
         for track_id in stale_ids:
             self.states.pop(track_id, None)
-            self.retired_ids.add(track_id)
+            self.retired_ids[track_id] = frame_index
         active_ids = {track_id for track_id, _, _ in observations}
         if self.id_stitch_enabled:
             new_observations = [item for item in observations if item[0] not in self.states and item[0] not in self.retired_ids]
@@ -301,8 +309,7 @@ class DirectionCounter:
                 recovered_state = self.states.pop(old_id)
                 self._promote_short_fragment(recovered_state)
                 self.states[new_id] = recovered_state
-                self.retired_ids.add(old_id)
-                self.recovered_ids[new_id] = old_id
+                self.retired_ids[old_id] = frame_index
                 self.last_recoveries[new_id] = old_id
                 matched_old.add(old_id)
                 matched_new.add(new_id)
@@ -530,6 +537,20 @@ def write_events(path: Path, events: Iterable[CountEvent]) -> None:
             })
 
 
+def write_video_results(
+    output_dir: Path,
+    video: Path,
+    counts: dict[int, dict[str, int]],
+    events: Iterable[CountEvent],
+) -> tuple[Path, Path]:
+    """Write the CSV pair for one source video and return their paths."""
+    summary_path = output_dir / f"{video.stem}_15분_유입유출_집계.csv"
+    events_path = output_dir / f"{video.stem}_차량별_통과기록.csv"
+    write_summary(summary_path, counts)
+    write_events(events_path, events)
+    return summary_path, events_path
+
+
 class BatchAnalyzer:
     def __init__(
         self,
@@ -575,6 +596,8 @@ class BatchAnalyzer:
         self.log(f"추적기: {tracker_config}")
         counts = {slot: {"유입": 0, "유출": 0} for slot in range(96)}
         events: list[CountEvent] = []
+        summary_path = output_dir / "15분_유입유출_집계.csv"
+        events_path = output_dir / "차량별_통과기록.csv"
         total_frames = 0
         metadata: list[tuple[Path, int, float]] = []
         for video in videos:
@@ -632,6 +655,8 @@ class BatchAnalyzer:
                 ),
                 fast_crossing_stable_frames=int(self.config.get("fast_crossing_stable_frames", 2)),
             )
+            video_counts = {slot: {"유입": 0, "유출": 0} for slot in range(96)}
+            video_events: list[CountEvent] = []
             start_seconds = video_start_seconds(video.name)
             cap = cv2.VideoCapture(str(video))
             frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -720,6 +745,7 @@ class BatchAnalyzer:
                         real_seconds = (start_seconds + video_seconds * speed_factor) % 86400
                         slot = int(real_seconds // 900)
                         counts[slot][direction] += 1
+                        video_counts[slot][direction] += 1
                         event = CountEvent(
                             video=video.name,
                             frame=frame_index,
@@ -735,6 +761,7 @@ class BatchAnalyzer:
                             point_y=point[1],
                         )
                         events.append(event)
+                        video_events.append(event)
                         self.log(f"  {event.real_time} {direction} {event.class_name} (ID {track_id})")
                         if self.config.get("save_event_images", True):
                             snapshot = frame.copy()
@@ -758,10 +785,20 @@ class BatchAnalyzer:
             prefetcher.close()
             if writer is not None:
                 writer.release()
+            video_summary_path, video_events_path = write_video_results(
+                output_dir,
+                video,
+                video_counts,
+                video_events,
+            )
+            # Refresh the compatible all-video outputs after every completed video.
+            write_summary(summary_path, counts)
+            write_events(events_path, events)
+            self.log(
+                f"  영상별 CSV 저장: {video_summary_path.name}, {video_events_path.name}"
+            )
             self.log(f"[{video_index}/{len(videos)}] 완료: {frame_index:,} 프레임")
 
-        summary_path = output_dir / "15분_유입유출_집계.csv"
-        events_path = output_dir / "차량별_통과기록.csv"
         write_summary(summary_path, counts)
         write_events(events_path, events)
         self.progress(1.0 if not self.stop_event.is_set() else processed_frames / max(total_frames, 1))

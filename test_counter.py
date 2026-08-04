@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from two_way_counter import CountEvent, DirectionCounter, FramePrefetcher, box_meets_minimum_size, point_in_polygon, roi_crop_bounds, slot_label, video_start_seconds, write_events, write_summary
+from two_way_counter import CountEvent, DirectionCounter, FramePrefetcher, box_meets_minimum_size, point_in_polygon, roi_crop_bounds, slot_label, video_start_seconds, write_events, write_summary, write_video_results
 
 
 class DirectionCounterTests(unittest.TestCase):
@@ -175,6 +175,8 @@ class DirectionCounterTests(unittest.TestCase):
         counter.update_frame([], 3)
         self.assertNotIn(1, counter.states)
         self.assertIn(1, counter.retired_ids)
+        counter.update_frame([], 6)
+        self.assertNotIn(1, counter.retired_ids)
 
 
 class UtilityTests(unittest.TestCase):
@@ -230,6 +232,22 @@ class UtilityTests(unittest.TestCase):
             with summary.open(encoding="utf-8-sig") as file:
                 rows = list(csv.reader(file))
             self.assertEqual(rows[1], ["00:00~00:15", "2", "1", "3"])
+            self.assertIn("00:00:03", events.read_text(encoding="utf-8-sig"))
+
+    def test_writes_separate_csv_pair_for_each_video(self):
+        counts = {slot: {"유입": 0, "유출": 0} for slot in range(96)}
+        counts[0]["유입"] = 1
+        event = CountEvent("01_0000-0300_3배속.mp4", 30, 1.0, 3.0, 0, "유입", 4, 2, "차량", 0.9, 10, 20)
+        with tempfile.TemporaryDirectory() as directory:
+            summary, events = write_video_results(
+                Path(directory),
+                Path(event.video),
+                counts,
+                [event],
+            )
+            self.assertEqual(summary.name, "01_0000-0300_3배속_15분_유입유출_집계.csv")
+            self.assertEqual(events.name, "01_0000-0300_3배속_차량별_통과기록.csv")
+            self.assertTrue(summary.exists())
             self.assertIn("00:00:03", events.read_text(encoding="utf-8-sig"))
 
 
