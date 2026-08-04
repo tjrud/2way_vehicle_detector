@@ -137,12 +137,14 @@ class DirectionCounter:
     ) -> float | None:
         if state.last_point is None or state.last_frame < 0:
             return None
-        if state.counted or state.stable_side == 0:
+        if state.counted:
+            return None
+        # A fragmented track often disappears before min_stable_frames is reached.
+        # Keep that short pre-line fragment eligible as long as it has a known side.
+        if state.stable_side == 0 and state.candidate_side == 0:
             return None
         gap = frame_index - state.last_frame
         if gap <= 0 or gap > self.id_stitch_max_gap:
-            return None
-        if state.class_id is not None and state.class_id != class_id:
             return None
         if abs(self.signed_distance(state.last_point)) > self.id_stitch_line_distance_px:
             return None
@@ -170,7 +172,18 @@ class DirectionCounter:
         allowed_distance = self.id_stitch_max_distance_px + min(gap, 30) * 2.0
         if distance > allowed_distance:
             return None
-        return distance + gap * 0.35
+        unstable_penalty = 12.0 if state.stable_side == 0 else 0.0
+        return distance + gap * 0.35 + unstable_penalty
+
+    @staticmethod
+    def _promote_short_fragment(state: TrackState) -> None:
+        """Preserve the known side when an ID changes before normal stabilization."""
+        if state.stable_side != 0 or state.candidate_side == 0 or state.last_point is None:
+            return
+        state.stable_side = state.candidate_side
+        state.anchor_point = state.last_point
+        state.candidate_side = 0
+        state.candidate_frames = 0
 
     def update_frame(
         self,
@@ -204,7 +217,9 @@ class DirectionCounter:
             for _, old_id, new_id in sorted(candidates):
                 if old_id in matched_old or new_id in matched_new or old_id not in self.states:
                     continue
-                self.states[new_id] = self.states.pop(old_id)
+                recovered_state = self.states.pop(old_id)
+                self._promote_short_fragment(recovered_state)
+                self.states[new_id] = recovered_state
                 self.retired_ids.add(old_id)
                 self.recovered_ids[new_id] = old_id
                 self.last_recoveries[new_id] = old_id
@@ -286,6 +301,9 @@ def default_config(source_dir: str) -> dict:
         "confidence": 0.22,
         "iou": 0.65,
         "image_size": 960,
+        "min_box_width_px": 35,
+        "min_box_height_px": 35,
+        "min_box_area_px": 2000,
         "speed_factor": 3.0,
         "vehicle_classes": VEHICLE_CLASSES,
         "roi_polygon": [[410, 470], [1260, 430], [1270, 900], [650, 870], [400, 670]],
@@ -344,6 +362,19 @@ def point_in_polygon(point: tuple[float, float], polygon: list[list[int]]) -> bo
             inside = not inside
         previous = current
     return inside
+
+
+def box_meets_minimum_size(
+    xyxy: tuple[float, float, float, float],
+    min_width_px: float,
+    min_height_px: float,
+    min_area_px: float,
+) -> bool:
+    """Reject tiny detections before they enter the direction counter."""
+    x1, y1, x2, y2 = xyxy
+    width = max(0.0, x2 - x1)
+    height = max(0.0, y2 - y1)
+    return width >= min_width_px and height >= min_height_px and width * height >= min_area_px
 
 
 def write_summary(path: Path, counts: dict[int, dict[str, int]]) -> None:
@@ -441,6 +472,9 @@ class BatchAnalyzer:
         polygon = np.array(self.config["roi_polygon"], dtype=np.int32)
         classes = [int(value) for value in self.config.get("vehicle_classes", VEHICLE_CLASSES)]
         speed_factor = float(self.config.get("speed_factor", 3.0))
+        min_box_width = float(self.config.get("min_box_width_px", 35))
+        min_box_height = float(self.config.get("min_box_height_px", 35))
+        min_box_area = float(self.config.get("min_box_area_px", 2000))
 
         for video_index, (video, expected_frames, fps) in enumerate(metadata, start=1):
             if self.stop_event.is_set():
@@ -504,6 +538,13 @@ class BatchAnalyzer:
                     track_details: list[tuple[int, tuple[float, float], int, float, tuple[float, float, float, float]]] = []
                     for xyxy, track_id, class_id, confidence in zip(coordinates, track_ids, class_ids, confidences):
                         x1, y1, x2, y2 = map(float, xyxy)
+                        if not box_meets_minimum_size(
+                            (x1, y1, x2, y2),
+                            min_box_width,
+                            min_box_height,
+                            min_box_area,
+                        ):
+                            continue
                         point = ((x1 + x2) / 2, y2)
                         if not point_in_polygon(point, self.config["roi_polygon"]):
                             continue
@@ -537,7 +578,7 @@ class BatchAnalyzer:
                             direction=direction,
                             track_id=track_id,
                             class_id=class_id,
-                            class_name=CLASS_LABELS.get(class_id, str(class_id)),
+                            class_name="차량",
                             confidence=confidence,
                             point_x=point[0],
                             point_y=point[1],

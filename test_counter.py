@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from two_way_counter import CountEvent, DirectionCounter, point_in_polygon, slot_label, video_start_seconds, write_events, write_summary
+from two_way_counter import CountEvent, DirectionCounter, box_meets_minimum_size, point_in_polygon, slot_label, video_start_seconds, write_events, write_summary
 
 
 class DirectionCounterTests(unittest.TestCase):
@@ -44,6 +44,38 @@ class DirectionCounterTests(unittest.TestCase):
         self.assertEqual(first_new_frame, {})
         self.assertEqual(counter.update_frame([(9, (63, 50), 2)], 6), {9: "유출"})
 
+    def test_recovers_id_switch_before_pre_line_side_is_stable(self):
+        counter = DirectionCounter(
+            [[50, 0], [50, 100]],
+            deadband_px=1,
+            min_stable_frames=3,
+            min_horizontal_motion_px=5,
+            id_stitch_max_gap=10,
+            id_stitch_max_distance_px=50,
+            id_stitch_line_distance_px=80,
+        )
+        counter.update_frame([(1, (42, 50), 2)], 0)
+        self.assertEqual(counter.update_frame([(9, (55, 50), 2)], 2), {})
+        self.assertEqual(counter.last_recoveries, {9: 1})
+        self.assertEqual(counter.update_frame([(9, (61, 50), 2)], 3), {})
+        self.assertEqual(counter.update_frame([(9, (67, 50), 2)], 4), {9: "유출"})
+
+    def test_accumulates_post_line_confirmation_across_repeated_id_switches(self):
+        counter = DirectionCounter(
+            [[50, 0], [50, 100]],
+            deadband_px=1,
+            min_stable_frames=3,
+            min_horizontal_motion_px=5,
+            id_stitch_max_gap=10,
+            id_stitch_max_distance_px=50,
+            id_stitch_line_distance_px=80,
+        )
+        counter.update_frame([(1, (42, 50), 2)], 0)
+        self.assertEqual(counter.update_frame([(9, (55, 50), 2)], 2), {})
+        self.assertEqual(counter.update_frame([(10, (61, 50), 2)], 3), {})
+        self.assertEqual(counter.update_frame([(11, (67, 50), 2)], 4), {11: "유출"})
+        self.assertEqual(counter.last_recoveries, {11: 10})
+
     def test_does_not_stitch_vehicle_moving_in_opposite_direction(self):
         counter = DirectionCounter(
             [[50, 0], [50, 100]],
@@ -77,7 +109,7 @@ class DirectionCounterTests(unittest.TestCase):
         self.assertEqual(counter.last_recoveries, {10: 2, 11: 1})
         self.assertEqual(set(counter.states), {10, 11})
 
-    def test_does_not_stitch_different_vehicle_classes(self):
+    def test_stitches_across_any_vehicle_class_change(self):
         counter = DirectionCounter(
             [[50, 0], [50, 100]],
             min_stable_frames=1,
@@ -86,8 +118,8 @@ class DirectionCounterTests(unittest.TestCase):
             id_stitch_line_distance_px=100,
         )
         counter.update_frame([(1, (40, 50), 2)], 0)
-        counter.update_frame([(9, (55, 50), 7)], 2)
-        self.assertEqual(counter.last_recoveries, {})
+        counter.update_frame([(9, (55, 50), 3)], 2)
+        self.assertEqual(counter.last_recoveries, {9: 1})
 
     def test_does_not_attach_a_new_vehicle_to_an_already_counted_track(self):
         counter = DirectionCounter(
@@ -117,6 +149,12 @@ class DirectionCounterTests(unittest.TestCase):
 
 
 class UtilityTests(unittest.TestCase):
+    def test_minimum_box_size_rejects_tiny_detections(self):
+        self.assertFalse(box_meets_minimum_size((0, 0, 34, 100), 35, 35, 2000))
+        self.assertFalse(box_meets_minimum_size((0, 0, 100, 34), 35, 35, 2000))
+        self.assertFalse(box_meets_minimum_size((0, 0, 40, 40), 35, 35, 2000))
+        self.assertTrue(box_meets_minimum_size((0, 0, 40, 55), 35, 35, 2000))
+
     def test_video_start_and_slot_labels(self):
         self.assertEqual(video_start_seconds("03_0600-0900_3배속.mp4"), 6 * 3600)
         self.assertEqual(slot_label(0), "00:00~00:15")
