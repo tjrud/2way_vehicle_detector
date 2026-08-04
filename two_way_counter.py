@@ -3,16 +3,79 @@ from __future__ import annotations
 import csv
 import json
 import math
+import queue
 import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 
 VEHICLE_CLASSES = [2, 3, 5, 7]  # COCO: car, motorcycle, bus, truck
 CLASS_LABELS = {1: "자전거", 2: "승용차", 3: "오토바이", 5: "버스", 7: "트럭"}
 VIDEO_PATTERN = re.compile(r"_(\d{2})(\d{2})-(\d{2})(\d{2})_")
+
+
+class FramePrefetcher:
+    """Decode frames on a background thread while inference handles the current frame."""
+
+    _END = object()
+
+    def __init__(
+        self,
+        capture: Any,
+        max_frames: int,
+        buffer_size: int = 8,
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        self.capture = capture
+        self.max_frames = max(0, int(max_frames))
+        self.stop_event = stop_event
+        self.frames: queue.Queue[Any] = queue.Queue(maxsize=max(1, int(buffer_size)))
+        self.closed = threading.Event()
+        self.worker = threading.Thread(target=self._decode, name="video-frame-prefetch", daemon=True)
+
+    def _put(self, item: Any) -> bool:
+        while not self.closed.is_set():
+            try:
+                self.frames.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _decode(self) -> None:
+        try:
+            for _ in range(self.max_frames):
+                if self.closed.is_set() or (self.stop_event is not None and self.stop_event.is_set()):
+                    break
+                ok, frame = self.capture.read()
+                if not ok or not self._put(frame):
+                    break
+        finally:
+            self.capture.release()
+            self._put(self._END)
+
+    def __iter__(self) -> Iterator[Any]:
+        self.worker.start()
+        try:
+            while True:
+                try:
+                    item = self.frames.get(timeout=0.1)
+                except queue.Empty:
+                    if not self.worker.is_alive():
+                        break
+                    continue
+                if item is self._END:
+                    break
+                yield item
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        self.closed.set()
+        if self.worker.is_alive():
+            self.worker.join(timeout=5.0)
 
 
 @dataclass
@@ -303,6 +366,7 @@ def default_config(source_dir: str) -> dict:
         "image_size": 960,
         "roi_crop_enabled": True,
         "roi_crop_padding_px": 64,
+        "frame_prefetch_buffer": 8,
         "min_box_width_px": 35,
         "min_box_height_px": 35,
         "min_box_area_px": 2000,
@@ -497,9 +561,20 @@ class BatchAnalyzer:
         speed_factor = float(self.config.get("speed_factor", 3.0))
         roi_crop_enabled = bool(self.config.get("roi_crop_enabled", True))
         roi_crop_padding = int(self.config.get("roi_crop_padding_px", 64))
+        frame_prefetch_buffer = int(self.config.get("frame_prefetch_buffer", 8))
         min_box_width = float(self.config.get("min_box_width_px", 35))
         min_box_height = float(self.config.get("min_box_height_px", 35))
         min_box_area = float(self.config.get("min_box_area_px", 2000))
+        track_options = {
+            "persist": True,
+            "tracker": tracker_config,
+            "conf": float(self.config.get("confidence", 0.22)),
+            "iou": float(self.config.get("iou", 0.65)),
+            "imgsz": int(self.config.get("image_size", 960)),
+            "classes": classes,
+            "device": device,
+            "verbose": False,
+        }
 
         for video_index, (video, expected_frames, fps) in enumerate(metadata, start=1):
             if self.stop_event.is_set():
@@ -536,6 +611,8 @@ class BatchAnalyzer:
             shifted_polygon = polygon - np.array([crop_left, crop_top], dtype=np.int32)
             roi_mask = np.zeros((crop_bottom - crop_top, crop_right - crop_left), dtype=np.uint8)
             cv2.fillPoly(roi_mask, [shifted_polygon], 255)
+            roi_mask_bgr = cv2.cvtColor(roi_mask, cv2.COLOR_GRAY2BGR)
+            masked_buffer = np.empty_like(roi_mask_bgr)
             self.log(
                 f"  ROI 크롭: {crop_right - crop_left}x{crop_bottom - crop_top} "
                 f"(원본 {frame_width}x{frame_height})"
@@ -550,34 +627,27 @@ class BatchAnalyzer:
                 writer = cv2.VideoWriter(str(review_path), cv2.VideoWriter_fourcc(*"mp4v"), fps / review_stride, review_size)
 
             frame_index = 0
-            while frame_index < expected_frames and not self.stop_event.is_set():
-                ok, frame = cap.read()
-                if not ok:
+            prefetcher = FramePrefetcher(cap, expected_frames, frame_prefetch_buffer, self.stop_event)
+            for frame in prefetcher:
+                if self.stop_event.is_set():
                     break
                 cropped = frame[crop_top:crop_bottom, crop_left:crop_right]
-                masked = cv2.bitwise_and(cropped, cropped, mask=roi_mask)
-                result = model.track(
-                    masked,
-                    persist=True,
-                    tracker=tracker_config,
-                    conf=float(self.config.get("confidence", 0.22)),
-                    iou=float(self.config.get("iou", 0.65)),
-                    imgsz=int(self.config.get("image_size", 960)),
-                    classes=classes,
-                    device=device,
-                    verbose=False,
-                )[0]
+                cv2.bitwise_and(cropped, roi_mask_bgr, dst=masked_buffer)
+                result = model.track(masked_buffer, **track_options)[0]
 
                 annotated = frame.copy() if writer is not None else frame
                 boxes = result.boxes
                 if boxes is not None and boxes.id is not None:
-                    coordinates = boxes.xyxy.cpu().numpy()
-                    track_ids = boxes.id.int().cpu().tolist()
-                    class_ids = boxes.cls.int().cpu().tolist()
-                    confidences = boxes.conf.cpu().tolist()
+                    box_rows = torch.cat(
+                        (boxes.xyxy, boxes.id[:, None], boxes.cls[:, None], boxes.conf[:, None]),
+                        dim=1,
+                    ).cpu().numpy()
                     track_details: list[tuple[int, tuple[float, float], int, float, tuple[float, float, float, float]]] = []
-                    for xyxy, track_id, class_id, confidence in zip(coordinates, track_ids, class_ids, confidences):
-                        x1, y1, x2, y2 = map(float, xyxy)
+                    for x1, y1, x2, y2, track_id_value, class_id_value, confidence_value in box_rows:
+                        x1, y1, x2, y2 = map(float, (x1, y1, x2, y2))
+                        track_id = int(track_id_value)
+                        class_id = int(class_id_value)
+                        confidence = float(confidence_value)
                         if not box_meets_minimum_size(
                             (x1, y1, x2, y2),
                             min_box_width,
@@ -648,7 +718,7 @@ class BatchAnalyzer:
                 if frame_index % 120 == 0:
                     self.progress(processed_frames / max(total_frames, 1))
 
-            cap.release()
+            prefetcher.close()
             if writer is not None:
                 writer.release()
             self.log(f"[{video_index}/{len(videos)}] 완료: {frame_index:,} 프레임")

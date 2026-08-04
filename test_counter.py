@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from two_way_counter import CountEvent, DirectionCounter, box_meets_minimum_size, point_in_polygon, roi_crop_bounds, slot_label, video_start_seconds, write_events, write_summary
+from two_way_counter import CountEvent, DirectionCounter, FramePrefetcher, box_meets_minimum_size, point_in_polygon, roi_crop_bounds, slot_label, video_start_seconds, write_events, write_summary
 
 
 class DirectionCounterTests(unittest.TestCase):
@@ -149,6 +149,25 @@ class DirectionCounterTests(unittest.TestCase):
 
 
 class UtilityTests(unittest.TestCase):
+    def test_frame_prefetcher_preserves_order_and_releases_capture(self):
+        class FakeCapture:
+            def __init__(self):
+                self.items = iter(["a", "b", "c"])
+                self.released = False
+
+            def read(self):
+                try:
+                    return True, next(self.items)
+                except StopIteration:
+                    return False, None
+
+            def release(self):
+                self.released = True
+
+        capture = FakeCapture()
+        self.assertEqual(list(FramePrefetcher(capture, 10, buffer_size=2)), ["a", "b", "c"])
+        self.assertTrue(capture.released)
+
     def test_roi_crop_bounds_adds_padding_and_clamps_to_frame(self):
         polygon = [[10, 20], [90, 20], [90, 80], [10, 80]]
         self.assertEqual(roi_crop_bounds(100, 100, polygon, 15), (0, 5, 100, 96))
