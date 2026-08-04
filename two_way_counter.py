@@ -301,6 +301,8 @@ def default_config(source_dir: str) -> dict:
         "confidence": 0.22,
         "iou": 0.65,
         "image_size": 960,
+        "roi_crop_enabled": True,
+        "roi_crop_padding_px": 64,
         "min_box_width_px": 35,
         "min_box_height_px": 35,
         "min_box_area_px": 2000,
@@ -375,6 +377,27 @@ def box_meets_minimum_size(
     width = max(0.0, x2 - x1)
     height = max(0.0, y2 - y1)
     return width >= min_width_px and height >= min_height_px and width * height >= min_area_px
+
+
+def roi_crop_bounds(
+    frame_width: int,
+    frame_height: int,
+    polygon: list[list[int]],
+    padding_px: int,
+) -> tuple[int, int, int, int]:
+    """Return clamped, exclusive ROI crop bounds with context padding."""
+    if not polygon:
+        raise ValueError("roi_polygon must contain at least one point")
+    padding = max(0, int(padding_px))
+    xs = [int(point[0]) for point in polygon]
+    ys = [int(point[1]) for point in polygon]
+    left = max(0, min(xs) - padding)
+    top = max(0, min(ys) - padding)
+    right = min(frame_width, max(xs) + padding + 1)
+    bottom = min(frame_height, max(ys) + padding + 1)
+    if right <= left or bottom <= top:
+        raise ValueError("roi_polygon does not overlap the video frame")
+    return left, top, right, bottom
 
 
 def write_summary(path: Path, counts: dict[int, dict[str, int]]) -> None:
@@ -472,6 +495,8 @@ class BatchAnalyzer:
         polygon = np.array(self.config["roi_polygon"], dtype=np.int32)
         classes = [int(value) for value in self.config.get("vehicle_classes", VEHICLE_CLASSES)]
         speed_factor = float(self.config.get("speed_factor", 3.0))
+        roi_crop_enabled = bool(self.config.get("roi_crop_enabled", True))
+        roi_crop_padding = int(self.config.get("roi_crop_padding_px", 64))
         min_box_width = float(self.config.get("min_box_width_px", 35))
         min_box_height = float(self.config.get("min_box_height_px", 35))
         min_box_area = float(self.config.get("min_box_area_px", 2000))
@@ -497,14 +522,30 @@ class BatchAnalyzer:
             )
             start_seconds = video_start_seconds(video.name)
             cap = cv2.VideoCapture(str(video))
+            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if roi_crop_enabled:
+                crop_left, crop_top, crop_right, crop_bottom = roi_crop_bounds(
+                    frame_width,
+                    frame_height,
+                    self.config["roi_polygon"],
+                    roi_crop_padding,
+                )
+            else:
+                crop_left, crop_top, crop_right, crop_bottom = 0, 0, frame_width, frame_height
+            shifted_polygon = polygon - np.array([crop_left, crop_top], dtype=np.int32)
+            roi_mask = np.zeros((crop_bottom - crop_top, crop_right - crop_left), dtype=np.uint8)
+            cv2.fillPoly(roi_mask, [shifted_polygon], 255)
+            self.log(
+                f"  ROI 크롭: {crop_right - crop_left}x{crop_bottom - crop_top} "
+                f"(원본 {frame_width}x{frame_height})"
+            )
             writer = None
             review_size: tuple[int, int] | None = None
             review_stride = max(1, int(self.config.get("review_stride", 3)))
             if self.config.get("save_review_video", False):
-                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                review_width = min(width, int(self.config.get("review_width", 640)))
-                review_size = (review_width, round(height * review_width / width))
+                review_width = min(frame_width, int(self.config.get("review_width", 640)))
+                review_size = (review_width, round(frame_height * review_width / frame_width))
                 review_path = output_dir / f"검수_{video.stem}.mp4"
                 writer = cv2.VideoWriter(str(review_path), cv2.VideoWriter_fourcc(*"mp4v"), fps / review_stride, review_size)
 
@@ -513,9 +554,8 @@ class BatchAnalyzer:
                 ok, frame = cap.read()
                 if not ok:
                     break
-                mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-                cv2.fillPoly(mask, [polygon], 255)
-                masked = cv2.bitwise_and(frame, frame, mask=mask)
+                cropped = frame[crop_top:crop_bottom, crop_left:crop_right]
+                masked = cv2.bitwise_and(cropped, cropped, mask=roi_mask)
                 result = model.track(
                     masked,
                     persist=True,
@@ -545,6 +585,10 @@ class BatchAnalyzer:
                             min_box_area,
                         ):
                             continue
+                        x1 += crop_left
+                        x2 += crop_left
+                        y1 += crop_top
+                        y2 += crop_top
                         point = ((x1 + x2) / 2, y2)
                         if not point_in_polygon(point, self.config["roi_polygon"]):
                             continue

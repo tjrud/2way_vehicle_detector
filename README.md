@@ -46,6 +46,7 @@
 - 기본 모델: `yolo26s.pt`
 - 기본 추적기: 가림 복원용 BoT-SORT + ReID (`botsort_reid.yaml`)
 - 기본 분석 크기: 960px
+- ROI 실제 크롭: 활성화, 주변 여백 64px (`roi_crop_enabled`, `roi_crop_padding_px`)
 - GPU: `0`을 선택하면 NVIDIA GPU, `cpu`를 선택하면 CPU
 - GPU 초기화에 실패하면 자동으로 CPU로 전환합니다.
 

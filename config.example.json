@@ -7,6 +7,8 @@
   "confidence": 0.22,
   "iou": 0.65,
   "image_size": 960,
+  "roi_crop_enabled": true,
+  "roi_crop_padding_px": 64,
   "min_box_width_px": 35,
   "min_box_height_px": 35,
   "min_box_area_px": 2000,

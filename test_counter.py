@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from two_way_counter import CountEvent, DirectionCounter, box_meets_minimum_size, point_in_polygon, slot_label, video_start_seconds, write_events, write_summary
+from two_way_counter import CountEvent, DirectionCounter, box_meets_minimum_size, point_in_polygon, roi_crop_bounds, slot_label, video_start_seconds, write_events, write_summary
 
 
 class DirectionCounterTests(unittest.TestCase):
@@ -149,6 +149,11 @@ class DirectionCounterTests(unittest.TestCase):
 
 
 class UtilityTests(unittest.TestCase):
+    def test_roi_crop_bounds_adds_padding_and_clamps_to_frame(self):
+        polygon = [[10, 20], [90, 20], [90, 80], [10, 80]]
+        self.assertEqual(roi_crop_bounds(100, 100, polygon, 15), (0, 5, 100, 96))
+        self.assertEqual(roi_crop_bounds(100, 100, polygon, 0), (10, 20, 91, 81))
+
     def test_minimum_box_size_rejects_tiny_detections(self):
         self.assertFalse(box_meets_minimum_size((0, 0, 34, 100), 35, 35, 2000))
         self.assertFalse(box_meets_minimum_size((0, 0, 100, 34), 35, 35, 2000))
