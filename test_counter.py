@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from two_way_counter import CountEvent, DirectionCounter, FramePrefetcher, box_meets_minimum_size, point_in_polygon, roi_crop_bounds, slot_label, video_start_seconds, write_events, write_summary, write_video_results
+from two_way_counter import CountEvent, DirectionCounter, FramePrefetcher, box_meets_minimum_size, point_in_polygon, reset_model_tracking_state, roi_crop_bounds, slot_label, video_start_seconds, write_events, write_summary, write_video_results
 
 
 class DirectionCounterTests(unittest.TestCase):
@@ -180,6 +180,38 @@ class DirectionCounterTests(unittest.TestCase):
 
 
 class UtilityTests(unittest.TestCase):
+    def test_resets_trackers_without_replacing_predictor(self):
+        class FakeTracker:
+            def __init__(self):
+                self.reset_count = 0
+
+            def reset(self):
+                self.reset_count += 1
+
+        class FakePredictor:
+            def __init__(self):
+                self.trackers = [FakeTracker(), FakeTracker()]
+                self.vid_path = ["old-a", "old-b"]
+                self._feats = object()
+
+        class FakeModel:
+            def __init__(self):
+                self.predictor = FakePredictor()
+
+        model = FakeModel()
+        original_predictor = model.predictor
+        self.assertTrue(reset_model_tracking_state(model))
+        self.assertIs(model.predictor, original_predictor)
+        self.assertEqual([tracker.reset_count for tracker in model.predictor.trackers], [1, 1])
+        self.assertEqual(model.predictor.vid_path, [None, None])
+        self.assertIsNone(model.predictor._feats)
+
+    def test_tracker_reset_is_noop_before_first_prediction(self):
+        class EmptyModel:
+            predictor = None
+
+        self.assertFalse(reset_model_tracking_state(EmptyModel()))
+
     def test_frame_prefetcher_preserves_order_and_releases_capture(self):
         class FakeCapture:
             def __init__(self):

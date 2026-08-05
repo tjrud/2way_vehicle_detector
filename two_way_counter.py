@@ -555,6 +555,20 @@ def write_video_results(
     return summary_path, events_path
 
 
+def reset_model_tracking_state(model: Any) -> bool:
+    """Reset trackers between videos without re-registering YOLO callbacks."""
+    predictor = getattr(model, "predictor", None)
+    trackers = getattr(predictor, "trackers", None) if predictor is not None else None
+    if not trackers:
+        return False
+    for tracker in trackers:
+        tracker.reset()
+    predictor.vid_path = [None] * len(trackers)
+    if hasattr(predictor, "_feats"):
+        predictor._feats = None
+    return True
+
+
 class BatchAnalyzer:
     def __init__(
         self,
@@ -644,8 +658,8 @@ class BatchAnalyzer:
             if self.stop_event.is_set():
                 break
             self.log(f"[{video_index}/{len(videos)}] {video.name} 분석 시작")
-            if getattr(model, "predictor", None) is not None:
-                model.predictor = None
+            if reset_model_tracking_state(model):
+                self.log("  영상 전환: 추적기 상태 초기화")
             direction_counter = DirectionCounter(
                 self.config["counting_line"],
                 deadband_px=float(self.config.get("deadband_px", 8)),
