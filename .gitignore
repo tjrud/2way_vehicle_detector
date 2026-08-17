@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.local_api_token
 config.json
 results/
 test_results/
