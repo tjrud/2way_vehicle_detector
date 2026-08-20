@@ -1,3 +1,9 @@
+"""Tkinter 기반의 기존 데스크톱 설정·분석 화면.
+
+통합 대시보드가 기본 실행 경로지만, ROI 설정과 로컬 단독 분석을 위해
+이 GUI도 유지한다. 실제 영상 처리는 :class:`BatchAnalyzer`에 위임한다.
+"""
+
 from __future__ import annotations
 
 import copy
@@ -18,7 +24,10 @@ DEFAULT_SOURCE = ""
 
 
 class CounterApp(tk.Tk):
+    """분석 설정을 편집하고 백그라운드 분석 스레드를 제어하는 창."""
+
     def __init__(self) -> None:
+        """설정 파일을 읽고 화면 상태 변수와 위젯을 초기화한다."""
         super().__init__()
         self.title("2way 차량 추적")
         self.geometry("900x720")
@@ -46,11 +55,13 @@ class CounterApp(tk.Tk):
         self.refresh_direction_text()
 
     def ensure_config(self) -> dict:
+        """설정 파일이 없으면 기본값으로 만든 뒤 현재 설정을 반환한다."""
         if not CONFIG_PATH.exists():
             save_config(CONFIG_PATH, default_config(DEFAULT_SOURCE))
         return load_config(CONFIG_PATH)
 
     def build_style(self) -> None:
+        """전체 화면에서 공유하는 ttk 색상과 글꼴 스타일을 정의한다."""
         style = ttk.Style(self)
         style.theme_use("clam")
         style.configure("TFrame", background="#eef3f1")
@@ -66,6 +77,7 @@ class CounterApp(tk.Tk):
         style.configure("Horizontal.TProgressbar", troughcolor="#dbe5e1", background="#237a57", thickness=15)
 
     def build_ui(self) -> None:
+        """설정, 실행 제어, 진행 로그 영역을 순서대로 구성한다."""
         container = ttk.Frame(self, padding=22)
         container.pack(fill="both", expand=True)
         ttk.Label(container, text="2way 차량 추적", style="Title.TLabel").pack(anchor="w")
@@ -119,21 +131,25 @@ class CounterApp(tk.Tk):
         self.log("준비 완료")
 
     def add_path_row(self, parent, row, label, variable, command) -> None:
+        """폴더 경로 입력창과 찾아보기 버튼 한 행을 추가한다."""
         ttk.Label(parent, text=label, style="Card.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=5)
         ttk.Entry(parent, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=5)
         ttk.Button(parent, text="찾기", command=command).grid(row=row, column=2, padx=(8, 0), pady=5)
 
     def choose_source(self) -> None:
+        """입력 영상 폴더를 사용자가 선택하도록 한다."""
         selected = filedialog.askdirectory(initialdir=self.source_var.get())
         if selected:
             self.source_var.set(selected)
 
     def choose_output(self) -> None:
+        """분석 결과를 저장할 폴더를 사용자가 선택하도록 한다."""
         selected = filedialog.askdirectory(initialdir=str(APP_DIR))
         if selected:
             self.output_var.set(selected)
 
     def save_form(self) -> dict:
+        """화면의 최신 입력값을 검증해 config.json에 저장한다."""
         config = load_config(CONFIG_PATH)
         config["source_dir"] = self.source_var.get().strip()
         config["output_dir"] = self.output_var.get().strip() or "results"
@@ -148,6 +164,7 @@ class CounterApp(tk.Tk):
         return config
 
     def open_calibration(self) -> None:
+        """분석이 멈춘 상태에서 ROI·통과선 보정 창을 연다."""
         if self.worker and self.worker.is_alive():
             messagebox.showwarning("분석 중", "분석을 중지한 뒤 영역을 설정하세요.")
             return
@@ -165,6 +182,7 @@ class CounterApp(tk.Tk):
             self.log(f"오류: {error}")
 
     def swap_direction(self) -> None:
+        """왼쪽→오른쪽 이동에 할당된 유입·유출 방향을 뒤집는다."""
         config = self.save_form()
         config["increasing_x_direction"] = "유출" if config.get("increasing_x_direction", "유출") == "유입" else "유입"
         save_config(CONFIG_PATH, config)
@@ -173,11 +191,13 @@ class CounterApp(tk.Tk):
         self.log("유입/유출 방향 판정을 서로 바꿨습니다.")
 
     def refresh_direction_text(self) -> None:
+        """현재 방향 설정을 사람이 읽을 수 있는 문장으로 갱신한다."""
         direction = self.config_data.get("increasing_x_direction", "유출")
         other = "유출" if direction == "유입" else "유입"
         self.direction_var.set(f"방향 기준: 화면 왼쪽→오른쪽 = {direction} / 오른쪽→왼쪽 = {other}")
 
     def run_test(self) -> None:
+        """대표 주간 영상의 첫 5분만 검수 영상과 함께 분석한다."""
         try:
             config = self.save_form()
             day_video = find_day_video(Path(config["source_dir"]))
@@ -189,6 +209,7 @@ class CounterApp(tk.Tk):
             messagebox.showerror("설정 오류", str(error))
 
     def run_full(self) -> None:
+        """확인을 받은 뒤 설정된 전체 영상의 장시간 분석을 시작한다."""
         try:
             config = self.save_form()
             if not messagebox.askyesno("전체 분석", "8개 영상을 순서대로 분석합니다.\n노트북 전원을 연결하고 절전 모드를 꺼 주세요.\n\n시작할까요?"):
@@ -198,6 +219,7 @@ class CounterApp(tk.Tk):
             messagebox.showerror("설정 오류", str(error))
 
     def start_worker(self, config: dict, limit_seconds=None, video_paths=None, title="분석") -> None:
+        """UI가 멈추지 않도록 BatchAnalyzer를 별도 스레드에서 실행한다."""
         if self.worker and self.worker.is_alive():
             messagebox.showwarning("분석 중", "이미 분석이 진행 중입니다.")
             return
@@ -207,6 +229,7 @@ class CounterApp(tk.Tk):
         self.log(f"{title} 시작")
 
         def work() -> None:
+            # Tkinter 위젯은 메인 스레드에서만 안전하므로 모든 UI 갱신은 after로 전달한다.
             try:
                 analyzer = BatchAnalyzer(
                     config,
@@ -230,11 +253,13 @@ class CounterApp(tk.Tk):
         self.worker.start()
 
     def set_progress(self, value: float, title: str) -> None:
+        """0~1 분석 진행률을 화면의 0~100% 값으로 변환한다."""
         percent = max(0.0, min(100.0, value * 100))
         self.progress_var.set(percent)
         self.status_var.set(f"{title} 진행 중 · {percent:.1f}%")
 
     def analysis_done(self, summary: Path, events: Path | None) -> None:
+        """완료된 결과 경로를 로그와 알림창에 표시한다."""
         self.progress_var.set(100)
         self.status_var.set("분석이 완료되었습니다.")
         self.log(f"집계표: {summary}")
@@ -245,12 +270,14 @@ class CounterApp(tk.Tk):
         messagebox.showinfo("분석 완료", f"결과를 저장했습니다.\n\n{summary.parent}")
 
     def stop_analysis(self) -> None:
+        """현재 프레임 처리가 끝난 뒤 멈추도록 협력적 중지를 요청한다."""
         if self.worker and self.worker.is_alive():
             self.stop_event.set()
             self.status_var.set("현재 프레임 처리 후 중지합니다…")
             self.log("중지 요청")
 
     def open_results(self) -> None:
+        """결과 폴더를 생성하고 Windows 탐색기로 연다."""
         config = self.save_form()
         path = Path(config["output_dir"])
         if not path.is_absolute():
@@ -259,6 +286,7 @@ class CounterApp(tk.Tk):
         os.startfile(path)
 
     def log(self, message: str) -> None:
+        """로그 창 끝에 메시지를 추가하고 최신 줄로 스크롤한다."""
         self.log_text.insert("end", message.rstrip() + "\n")
         self.log_text.see("end")
 

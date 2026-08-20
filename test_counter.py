@@ -1,3 +1,5 @@
+"""핵심 통과 판정, ID 연결, 성능 보조 함수와 CSV 출력을 검증한다."""
+
 import csv
 import tempfile
 import unittest
@@ -7,6 +9,7 @@ from two_way_counter import CountEvent, DirectionCounter, FramePrefetcher, box_m
 
 
 class DirectionCounterTests(unittest.TestCase):
+    """실제 차량 이동 시나리오별 유입·유출 및 ID 복원 회귀 테스트."""
     def test_fast_crossing_uses_two_post_line_frames(self):
         counter = DirectionCounter(
             [[50, 0], [50, 100]],
@@ -180,6 +183,7 @@ class DirectionCounterTests(unittest.TestCase):
 
 
 class UtilityTests(unittest.TestCase):
+    """추적기 초기화, 프레임 버퍼, ROI와 파일 출력 보조 기능 테스트."""
     def test_resets_trackers_without_replacing_predictor(self):
         class FakeTracker:
             def __init__(self):

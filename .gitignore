@@ -1,6 +1,11 @@
 __pycache__/
 *.py[cod]
 .venv/
+.runtime/
+.pnpm-store/
+Ultralytics/
+logs/
+integrated_processes.json
 config.json
 results/
 test_results/

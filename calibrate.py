@@ -1,3 +1,5 @@
+"""대표 영상 프레임에서 ROI 다각형과 차량 통과선을 설정하는 도구."""
+
 from __future__ import annotations
 
 import sys
@@ -7,6 +9,7 @@ from two_way_counter import load_config, save_config
 
 
 def find_day_video(source_dir: Path) -> Path:
+    """보정·시험용 09~12시 영상(04_*)을 우선 선택한다."""
     preferred = sorted(source_dir.glob("04_*.mp4"))
     videos = preferred or sorted(source_dir.glob("*.mp4"))
     if not videos:
@@ -15,6 +18,7 @@ def find_day_video(source_dir: Path) -> Path:
 
 
 def draw_overlay(cv2, frame, roi, line, phase, scale):
+    """현재 클릭한 좌표와 단계별 조작 안내를 미리보기 위에 그린다."""
     image = frame.copy()
     scaled_roi = [(round(x * scale), round(y * scale)) for x, y in roi]
     scaled_line = [(round(x * scale), round(y * scale)) for x, y in line]
@@ -37,6 +41,7 @@ def draw_overlay(cv2, frame, roi, line, phase, scale):
 
 
 def calibrate(config_path: Path) -> Path | None:
+    """마우스로 ROI와 통과선을 받아 설정 및 미리보기 이미지를 저장한다."""
     import cv2
 
     config = load_config(config_path)
@@ -59,6 +64,7 @@ def calibrate(config_path: Path) -> Path | None:
     window = "2way calibration"
 
     def on_mouse(event, x, y, flags, param):
+        # 화면은 축소될 수 있으므로 클릭 좌표를 원본 해상도로 되돌려 저장한다.
         del flags, param
         if event != cv2.EVENT_LBUTTONDOWN:
             return

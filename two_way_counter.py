@@ -1,3 +1,9 @@
+"""YOLO 추적 결과를 유입·유출 이벤트와 15분 단위 CSV로 변환한다.
+
+이 모듈은 UI에 의존하지 않는 핵심 분석 계층이다. ROI 크롭, 프레임 선행
+디코딩, 최소 박스 필터, 통과선 판정, ID 조각 재연결과 결과 저장을 담당한다.
+"""
+
 from __future__ import annotations
 
 import csv
@@ -28,6 +34,7 @@ class FramePrefetcher:
         buffer_size: int = 8,
         stop_event: threading.Event | None = None,
     ) -> None:
+        """캡처 객체와 최대 프레임 수 및 제한된 버퍼를 저장한다."""
         self.capture = capture
         self.max_frames = max(0, int(max_frames))
         self.stop_event = stop_event
@@ -36,6 +43,7 @@ class FramePrefetcher:
         self.worker = threading.Thread(target=self._decode, name="video-frame-prefetch", daemon=True)
 
     def _put(self, item: Any) -> bool:
+        """중지 여부를 확인하며 버퍼에 프레임 또는 종료 표식을 넣는다."""
         while not self.closed.is_set():
             try:
                 self.frames.put(item, timeout=0.1)
@@ -45,6 +53,7 @@ class FramePrefetcher:
         return False
 
     def _decode(self) -> None:
+        """백그라운드에서 순서대로 디코딩하고 항상 캡처를 해제한다."""
         try:
             for _ in range(self.max_frames):
                 if self.closed.is_set() or (self.stop_event is not None and self.stop_event.is_set()):
@@ -57,6 +66,7 @@ class FramePrefetcher:
             self._put(self._END)
 
     def __iter__(self) -> Iterator[Any]:
+        """생산 스레드를 시작하고 원래 영상 순서대로 프레임을 제공한다."""
         self.worker.start()
         try:
             while True:
@@ -73,6 +83,7 @@ class FramePrefetcher:
             self.close()
 
     def close(self) -> None:
+        """디코더에 종료를 알리고 짧게 합류해 리소스 누수를 막는다."""
         self.closed.set()
         if self.worker.is_alive():
             self.worker.join(timeout=5.0)
@@ -80,6 +91,7 @@ class FramePrefetcher:
 
 @dataclass
 class TrackState:
+    """하나의 추적 ID에 대해 통과선 측면, 이동 속도와 집계 여부를 보존한다."""
     stable_side: int = 0
     candidate_side: int = 0
     candidate_frames: int = 0
@@ -94,6 +106,7 @@ class TrackState:
 
 @dataclass
 class CountEvent:
+    """CSV 및 검수 이미지에 기록할 한 번의 차량 통과 사건."""
     video: str
     frame: int
     video_seconds: float
@@ -109,6 +122,7 @@ class CountEvent:
 
     @property
     def real_time(self) -> str:
+        """자정을 순환하는 실제 영상 시각을 HH:MM:SS로 표시한다."""
         total = int(self.real_seconds) % 86400
         return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
 
@@ -163,18 +177,21 @@ class DirectionCounter:
         self.last_recoveries: dict[int, int] = {}
 
     def signed_distance(self, point: tuple[float, float]) -> float:
+        """통과선 한쪽은 양수, 반대쪽은 음수가 되는 수직 거리를 계산한다."""
         ax, ay = self.a
         bx, by = self.b
         px, py = point
         return ((bx - ax) * (py - ay) - (by - ay) * (px - ax)) / self.length
 
     def side(self, point: tuple[float, float]) -> int:
+        """데드밴드는 0, 통과선 양쪽은 각각 -1 또는 1로 분류한다."""
         distance = self.signed_distance(point)
         if abs(distance) <= self.deadband_px:
             return 0
         return 1 if distance > 0 else -1
 
     def projection_ratio(self, point: tuple[float, float]) -> float:
+        """점이 유한 통과선의 시작 0과 끝 1 사이 어디에 투영되는지 계산한다."""
         ax, ay = self.a
         bx, by = self.b
         px, py = point
@@ -195,6 +212,7 @@ class DirectionCounter:
         frame_index: int | None,
         class_id: int | None,
     ) -> None:
+        """새 좌표로 프레임당 속도와 마지막 관측 메타데이터를 갱신한다."""
         if state.last_point is not None:
             frame_gap = 1
             if frame_index is not None and state.last_frame >= 0:
@@ -216,6 +234,7 @@ class DirectionCounter:
         class_id: int,
         frame_index: int,
     ) -> float | None:
+        """사라진 ID와 새 ID가 같은 차량일 가능성을 거리 점수로 평가한다."""
         if state.last_point is None or state.last_frame < 0:
             return None
         if state.counted:
@@ -328,6 +347,7 @@ class DirectionCounter:
         frame_index: int | None = None,
         class_id: int | None = None,
     ) -> str | None:
+        """한 ID의 측면 변화를 누적해 확정된 유입·유출만 한 번 반환한다."""
         if track_id in self.retired_ids:
             return None
         state = self.states.setdefault(track_id, TrackState())
@@ -391,6 +411,7 @@ class DirectionCounter:
 
 
 def default_config(source_dir: str) -> dict:
+    """정확도와 장시간 실행을 고려한 기본 분석 설정을 반환한다."""
     return {
         "source_dir": source_dir,
         "output_dir": "results",
@@ -432,16 +453,19 @@ def default_config(source_dir: str) -> dict:
 
 
 def load_config(path: Path) -> dict:
+    """UTF-8 JSON 설정 파일을 읽는다."""
     with path.open("r", encoding="utf-8") as file:
         return json.load(file)
 
 
 def save_config(path: Path, config: dict) -> None:
+    """한국어를 이스케이프하지 않고 사람이 읽기 좋은 JSON으로 저장한다."""
     with path.open("w", encoding="utf-8") as file:
         json.dump(config, file, ensure_ascii=False, indent=2)
 
 
 def video_start_seconds(filename: str) -> int:
+    """파일명의 _HHMM-HHMM_ 구간에서 시작 시각을 초 단위로 추출한다."""
     match = VIDEO_PATTERN.search(filename)
     if not match:
         raise ValueError(f"파일명에서 시작 시간을 찾을 수 없습니다: {filename}")
@@ -450,12 +474,14 @@ def video_start_seconds(filename: str) -> int:
 
 
 def slot_label(slot: int) -> str:
+    """0~95 슬롯을 15분 시간 구간 문자열로 변환한다."""
     start = slot * 15
     end = (start + 15) % (24 * 60)
     return f"{start // 60:02d}:{start % 60:02d}~{end // 60:02d}:{end % 60:02d}"
 
 
 def point_in_polygon(point: tuple[float, float], polygon: list[list[int]]) -> bool:
+    """외부 의존성 없이 광선 교차법으로 점의 ROI 포함 여부를 판정한다."""
     # Dependency-free ray casting, also used by unit tests.
     x, y = point
     inside = False
@@ -505,6 +531,7 @@ def roi_crop_bounds(
 
 
 def write_summary(path: Path, counts: dict[int, dict[str, int]]) -> None:
+    """Excel 호환 UTF-8 BOM을 사용해 96개 15분 집계 행을 저장한다."""
     with path.open("w", newline="", encoding="utf-8-sig") as file:
         writer = csv.writer(file)
         writer.writerow(["시간", "유입", "유출", "합계"])
@@ -515,6 +542,7 @@ def write_summary(path: Path, counts: dict[int, dict[str, int]]) -> None:
 
 
 def write_events(path: Path, events: Iterable[CountEvent]) -> None:
+    """차량별 통과 사건을 상세 CSV로 저장한다."""
     with path.open("w", newline="", encoding="utf-8-sig") as file:
         fieldnames = [
             "실제시간", "15분구간", "방향", "차종", "추적ID", "신뢰도",
@@ -570,6 +598,8 @@ def reset_model_tracking_state(model: Any) -> bool:
 
 
 class BatchAnalyzer:
+    """여러 MP4를 순차 분석하고 영상별·전체 결과를 지속적으로 저장한다."""
+
     def __init__(
         self,
         config: dict,
@@ -578,6 +608,7 @@ class BatchAnalyzer:
         progress: Callable[[float], None] | None = None,
         stop_event: threading.Event | None = None,
     ) -> None:
+        """설정과 로그·진행률·중지 콜백을 주입받아 UI와 분리한다."""
         self.config = config
         self.config_dir = config_dir
         self.log = log or print
@@ -589,11 +620,13 @@ class BatchAnalyzer:
         limit_seconds: float | None = None,
         video_paths: list[Path] | None = None,
     ) -> tuple[Path, Path | None]:
+        """대상 영상을 분석하고 전체 집계 및 선택적 상세 CSV 경로를 반환한다."""
         import cv2
         import numpy as np
         import torch
         from ultralytics import YOLO
 
+        # 무거운 영상·AI 의존성은 실제 분석이 시작될 때만 불러온다.
         source_dir = Path(self.config["source_dir"])
         output_dir = Path(self.config.get("output_dir", "results"))
         if not output_dir.is_absolute():
@@ -622,6 +655,7 @@ class BatchAnalyzer:
         summary_path = output_dir / "15분_유입유출_집계.csv"
         events_path = output_dir / "차량별_통과기록.csv" if save_detailed_records else None
         total_frames = 0
+        # 먼저 전체 프레임 수를 계산해야 모든 영상에 걸친 진행률을 낼 수 있다.
         metadata: list[tuple[Path, int, float]] = []
         for video in videos:
             cap = cv2.VideoCapture(str(video))
@@ -693,6 +727,7 @@ class BatchAnalyzer:
                 )
             else:
                 crop_left, crop_top, crop_right, crop_bottom = 0, 0, frame_width, frame_height
+            # 추론에는 잘라낸 좌표계를 쓰되 통과 판정과 결과 기록은 원본 좌표로 복원한다.
             shifted_polygon = polygon - np.array([crop_left, crop_top], dtype=np.int32)
             roi_mask = np.zeros((crop_bottom - crop_top, crop_right - crop_left), dtype=np.uint8)
             cv2.fillPoly(roi_mask, [shifted_polygon], 255)
@@ -749,6 +784,7 @@ class BatchAnalyzer:
                             continue
                         track_details.append((track_id, point, class_id, float(confidence), (x1, y1, x2, y2)))
 
+                    # 한 프레임의 모든 ID를 함께 전달해야 동시 가림을 일대일로 연결할 수 있다.
                     directions = direction_counter.update_frame(
                         [(track_id, point, class_id) for track_id, point, class_id, _, _ in track_details],
                         frame_index,
