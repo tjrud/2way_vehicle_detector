@@ -27,7 +27,7 @@ def write_status(path: Path, **values: object) -> None:
 
 def main() -> None:
     """설정을 읽어 시험 또는 전체 분석을 실행하고 최종 상태를 기록한다."""
-    parser = argparse.ArgumentParser(description="2way 차량 유입·유출 분석")
+    parser = argparse.ArgumentParser(description="교차로·도로 차량 유입·유출 및 방향별 이동 분석")
     parser.add_argument("--test", action="store_true", help="주간 영상 5분만 시험 분석")
     args = parser.parse_args()
     app_dir = Path(__file__).resolve().parent
@@ -65,8 +65,12 @@ def main() -> None:
             test=bool(args.test),
             summary_csv=str(summary),
             events_csv=str(events) if events is not None else None,
+            report_txt=str(analyzer.report_path) if analyzer.report_path else None,
+            outputs=analyzer.outputs,
         )
         print(f"\n집계표: {summary}\n통과 기록: {events}")
+        if analyzer.report_path and analyzer.report_path.exists():
+            print("\n" + analyzer.report_path.read_text(encoding="utf-8-sig"))
     except BaseException:
         error_path.write_text(traceback.format_exc(), encoding="utf-8")
         write_status(
