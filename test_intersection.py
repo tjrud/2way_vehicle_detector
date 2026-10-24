@@ -122,8 +122,9 @@ class GateGeometryTests(unittest.TestCase):
             build_gates({"gates": [{"line": [[0, 0], [3, 3]]}]})
 
     def test_pixel_scale(self):
-        self.assertEqual(resolve_pixel_scale({"pixel_scale": "auto"}, 1080), 1.0)
-        self.assertAlmostEqual(resolve_pixel_scale({}, 720), 720 / 1080)
+        self.assertEqual(resolve_pixel_scale({"pixel_scale": "auto"}, 960), 1.0)
+        self.assertAlmostEqual(resolve_pixel_scale({}, 720), 720 / 960)
+        self.assertAlmostEqual(resolve_pixel_scale({"pixel_scale_reference_height": 1080}, 1080), 1.0)
         self.assertEqual(resolve_pixel_scale({"pixel_scale": 1.5}, 720), 1.5)
 
 

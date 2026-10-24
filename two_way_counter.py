@@ -299,11 +299,11 @@ def roi_crop_bounds(
 
 
 def resolve_pixel_scale(config: dict, frame_height: int) -> float:
-    """px 단위 기준값을 영상 해상도에 맞춘다. auto는 1080p를 1.0으로 본다."""
+    """px 단위 기준값을 영상 해상도에 맞춘다. 기본값은 높이 960px(기준 카메라)을 1.0으로 본다."""
     value = config.get("pixel_scale", "auto")
     if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
         return float(value)
-    reference = float(config.get("pixel_scale_reference_height", 1080) or 1080)
+    reference = float(config.get("pixel_scale_reference_height", 960) or 960)
     if frame_height <= 0:
         return 1.0
     return max(0.4, min(2.5, frame_height / reference))

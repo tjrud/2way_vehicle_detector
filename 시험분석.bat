@@ -8,9 +8,12 @@ pause
 exit /b 1
 
 :run
-REM 표준 출력과 오류를 하나의 로그로 남겨 창을 닫은 뒤에도 원인을 확인한다.
-if not exist "test_results" mkdir "test_results"
-".venv\Scripts\python.exe" run_analysis.py --test > "test_results\analysis.log" 2>&1
+REM 진행 상황을 이 창에 표시하고 결과 폴더의 analysis.log에도 같은 내용을 남긴다.
+chcp 65001 >nul
+set "PYTHONUTF8=1"
+".venv\Scripts\python.exe" run_analysis.py --test
 set "EXIT_CODE=%ERRORLEVEL%"
-if not "%EXIT_CODE%"=="0" echo Analysis failed with exit code %EXIT_CODE%.
+echo.
+if "%EXIT_CODE%"=="0" (echo Analysis finished. Check the result folder.) else (echo Analysis failed with exit code %EXIT_CODE%.)
+pause
 exit /b %EXIT_CODE%

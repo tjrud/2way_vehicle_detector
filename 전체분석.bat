@@ -8,8 +8,12 @@ pause
 exit /b 1
 
 :run
-REM 장시간 실행 중 콘솔 출력이 쌓이지 않도록 analysis.log로 보낸다.
-".venv\Scripts\python.exe" run_analysis.py > "analysis.log" 2>&1
+REM 진행 상황을 이 창에 표시하고 결과 폴더의 analysis.log에도 같은 내용을 남긴다.
+chcp 65001 >nul
+set "PYTHONUTF8=1"
+".venv\Scripts\python.exe" run_analysis.py
 set "EXIT_CODE=%ERRORLEVEL%"
-if not "%EXIT_CODE%"=="0" echo Analysis failed with exit code %EXIT_CODE%.
+echo.
+if "%EXIT_CODE%"=="0" (echo Analysis finished. Check the result folder.) else (echo Analysis failed with exit code %EXIT_CODE%.)
+pause
 exit /b %EXIT_CODE%

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import threading
 import traceback
 from datetime import datetime
@@ -44,16 +45,38 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     status_path = output_dir / "analysis_status.json"
     error_path = output_dir / "analysis_error.log"
+    # 창에도 보이고 analysis.log에도 남도록 같은 내용을 UTF-8로 두 곳에 쓴다.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+        except (AttributeError, ValueError):
+            pass
+    log_file = (output_dir / "analysis.log").open("w", encoding="utf-8")
+    last_percent = [-1]
+
+    def log(message: str) -> None:
+        stamp = datetime.now().strftime("%H:%M:%S")
+        line = f"[{stamp}] {message}"
+        print(line, flush=True)
+        log_file.write(line + "\n")
+        log_file.flush()
 
     def update_progress(value: float) -> None:
         # 모니터는 이 파일만 읽으므로 분석 콜백마다 최신 진행률을 원자적으로 기록한다.
         write_status(status_path, status="running", progress=round(value, 6), test=bool(args.test))
+        percent = int(value * 100)
+        if percent >= last_percent[0] + 5 or (percent == 100 and last_percent[0] != 100):
+            last_percent[0] = percent
+            log(f"진행 {percent}%")
+
+    log("시험 분석(5분)을 시작합니다. 이 창을 닫지 마세요." if args.test else "전체 분석을 시작합니다. 이 창을 닫지 마세요.")
 
     write_status(status_path, status="running", progress=0.0, test=bool(args.test))
     try:
         analyzer = BatchAnalyzer(
             config,
             app_dir,
+            log=log,
             progress=update_progress,
             stop_event=threading.Event(),
         )
@@ -68,9 +91,10 @@ def main() -> None:
             report_txt=str(analyzer.report_path) if analyzer.report_path else None,
             outputs=analyzer.outputs,
         )
-        print(f"\n집계표: {summary}\n통과 기록: {events}")
+        log(f"집계표: {summary}")
+        log(f"통과 기록: {events}")
         if analyzer.report_path and analyzer.report_path.exists():
-            print("\n" + analyzer.report_path.read_text(encoding="utf-8-sig"))
+            log("\n" + analyzer.report_path.read_text(encoding="utf-8-sig"))
     except BaseException:
         error_path.write_text(traceback.format_exc(), encoding="utf-8")
         write_status(
@@ -80,7 +104,10 @@ def main() -> None:
             test=bool(args.test),
             error_log=str(error_path),
         )
+        log(f"오류가 발생했습니다. 자세한 내용: {error_path}")
         raise
+    finally:
+        log_file.close()
 
 
 if __name__ == "__main__":
