@@ -43,6 +43,13 @@ def main() -> None:
     if not output_dir.is_absolute():
         output_dir = app_dir / output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.test:
+        # 시험 결과끼리 섞이지 않도록 이전 시험의 통과 사진과 검수 영상을 지운다.
+        for old_file in [*(output_dir / "event_images").glob("*.jpg"), *output_dir.glob("검수_*.mp4")]:
+            try:
+                old_file.unlink()
+            except OSError:
+                pass
     status_path = output_dir / "analysis_status.json"
     error_path = output_dir / "analysis_error.log"
     # 창에도 보이고 analysis.log에도 남도록 같은 내용을 UTF-8로 두 곳에 쓴다.

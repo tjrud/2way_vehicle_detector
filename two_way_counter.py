@@ -204,6 +204,7 @@ def default_config(source_dir: str) -> dict:
         "line_margin_px": 40,
         "uturn_min_depth_px": 60,
         "velocity_smoothing": 0.5,
+        "occluded_bottom_ratio": 0.5,
         "id_stitch_enabled": True,
         "id_stitch_in_transit": True,
         "id_stitch_max_gap": 90,
@@ -262,6 +263,26 @@ def point_in_polygon(point: tuple[float, float], polygon: list[list[int]]) -> bo
             inside = not inside
         previous = current
     return inside
+
+
+def hidden_bottom_ratio(
+    box: tuple[float, float, float, float],
+    others: Iterable[tuple[float, float, float, float]],
+) -> float:
+    """박스 아래 변이 앞쪽(화면 아래쪽) 차량 박스에 가려진 가로 비율을 계산한다.
+
+    가려진 차량의 박스는 실제 바퀴가 아니라 앞차 경계에서 끝나므로 하단 중앙점이
+    통과선을 넘은 것처럼 튈 수 있다. 이 비율이 크면 그 프레임은 판정에서 뺀다.
+    """
+    x1, y1, x2, y2 = box
+    width = max(1e-6, x2 - x1)
+    height = max(1e-6, y2 - y1)
+    hidden = 0.0
+    for ox1, oy1, ox2, oy2 in others:
+        if oy2 <= y2 + 0.05 * height or oy1 >= y2:
+            continue
+        hidden = max(hidden, max(0.0, min(x2, ox2) - max(x1, ox1)) / width)
+    return hidden
 
 
 def box_meets_minimum_size(
@@ -655,7 +676,8 @@ class BatchAnalyzer:
         od_path = output_dir / "OD_행렬.csv"
         trips_path = output_dir / "차량별_이동경로.csv"
         self.report_path = output_dir / "분석요약.txt"
-        stats = {"frames": 0, "recoveries": 0, "ignored": 0, "half_fallback": False, "videos": 0}
+        stats = {"frames": 0, "recoveries": 0, "ignored": 0, "occluded": 0, "half_fallback": False, "videos": 0}
+        occluded_limit = float(self.config.get("occluded_bottom_ratio", 0.5) or 0)
 
         # 먼저 전체 프레임 수를 계산해야 모든 영상에 걸친 진행률을 낼 수 있다.
         metadata: list[tuple[Path, int, float]] = []
@@ -824,8 +846,16 @@ class BatchAnalyzer:
 
                 # 한 프레임의 모든 ID를 함께 전달해야 동시 가림을 일대일로 연결할 수 있다.
                 # 차량이 없는 프레임도 전달해야 사라진 ID가 제때 정리된다.
+                judged = track_details
+                if occluded_limit > 0 and len(track_details) > 1:
+                    boxes = [item[4] for item in track_details]
+                    judged = [
+                        item for index, item in enumerate(track_details)
+                        if hidden_bottom_ratio(item[4], boxes[:index] + boxes[index + 1:]) < occluded_limit
+                    ]
+                    stats["occluded"] += len(track_details) - len(judged)
                 crossings = counter.process_frame(
-                    [(track_id, point, class_id, confidence) for track_id, point, class_id, confidence, _ in track_details],
+                    [(track_id, point, class_id, confidence) for track_id, point, class_id, confidence, _ in judged],
                     frame_index,
                 )
                 for new_id, old_id in counter.last_recoveries.items():
@@ -961,7 +991,7 @@ def build_report(
     minutes, seconds = divmod(int(elapsed_seconds), 60)
     lines = [
         f"분석 요약 · {datetime.now().strftime('%Y-%m-%d %H:%M')}" + (" · 시험 분석" if limit_seconds else ""),
-        f"설정: {INTERSECTION_TYPES.get(str(config.get('intersection_type', '')), '사용자 지정')} · 통과선 {len(gates)}개 · "
+        f"설정: {INTERSECTION_TYPES.get(str(config.get('intersection_type') or ('2way' if len(gates) == 1 else 'custom')), '사용자 지정')} · 통과선 {len(gates)}개 · "
         f"모델 {config.get('model')} · 장치 {device}{' FP16' if half else ''} · 입력 {config.get('image_size', 960)}px",
         f"처리: 영상 {stats['videos']}개 · {stats['frames']:,}프레임 · {fps:.1f} fps · {minutes}분 {seconds}초",
         f"합계: 유입 {total_in:,} / 유출 {total_out:,}",
@@ -977,7 +1007,7 @@ def build_report(
             for gate, (gate_in, gate_out) in zip(gates, gate_totals)
         ))
     else:
-        lines.append(f"유입 방향: {screen_direction_text(gates[0])} (통과선 {gates[0].name})")
+        lines.append(f"유입 방향: {screen_direction_text(gates[0])}")
     complete = no_exit = no_entry = 0
     if trip_mode:
         ranked = []
@@ -998,7 +1028,7 @@ def build_report(
         all_trips = complete + no_exit + no_entry
         share = (no_exit + no_entry) / all_trips * 100 if all_trips else 0.0
         lines.append(f"미확인 이동: 도착 미확인 {no_exit} · 출발 미확인 {no_entry} ({share:.0f}%)")
-    lines.append(f"ID 재연결 {stats['recoveries']}회 · 무시한 중복 통과 {stats['ignored']}회"
+    lines.append(f"ID 재연결 {stats['recoveries']}회 · 무시한 중복 통과 {stats['ignored']}회 · 가려진 바닥점 제외 {stats.get('occluded', 0):,}건"
                  + (" · FP16→FP32 전환됨" if stats.get("half_fallback") else ""))
 
     warnings: list[str] = []

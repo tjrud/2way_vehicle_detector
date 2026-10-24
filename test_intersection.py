@@ -25,6 +25,7 @@ from two_way_counter import (
     build_counter,
     default_config,
     empty_counts,
+    hidden_bottom_ratio,
     resolve_pixel_scale,
     write_gate_summary,
     write_movement_summary,
@@ -120,6 +121,13 @@ class GateGeometryTests(unittest.TestCase):
     def test_rejects_too_short_gate(self):
         with self.assertRaises(ValueError):
             build_gates({"gates": [{"line": [[0, 0], [3, 3]]}]})
+
+    def test_hidden_bottom_ratio(self):
+        front = (100, 100, 300, 300)
+        self.assertEqual(hidden_bottom_ratio((150, 120, 250, 200), [front]), 1.0)
+        self.assertAlmostEqual(hidden_bottom_ratio((250, 120, 350, 200), [front]), 0.5)
+        self.assertEqual(hidden_bottom_ratio((150, 320, 250, 400), [front]), 0.0)  # 앞에 있는 차
+        self.assertEqual(hidden_bottom_ratio((310, 120, 400, 290), [front]), 0.0)  # 옆 차
 
     def test_pixel_scale(self):
         self.assertEqual(resolve_pixel_scale({"pixel_scale": "auto"}, 960), 1.0)
@@ -411,6 +419,35 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(len(images), 6)
         self.assertTrue(review_exists)
         self.assertEqual({row["통과선"] for row in event_rows}, {"북", "동", "남", "서"})
+
+    def test_occluded_fragment_box_is_not_counted(self):
+        # 나가는 큰 차 뒤에 가려진 차의 박스(아래 변이 앞차에 가림)가 반대로 넘어가도 세지 않는다.
+        from two_way_counter import BatchAnalyzer
+
+        script: dict[int, list] = {}
+        for frame, x in enumerate(range(150, 500, 12)):
+            script.setdefault(frame, []).append([x - 60, 200, x + 60, 300, 1, 2, 0.9])
+            if 306 <= x <= 374:
+                # 앞차가 지나가는 동안 기다리던 차의 박스가 앞차 경계 쪽(통과선 너머)으로 튄다.
+                script[frame].append([315, 230, 365, 270, 2, 2, 0.6])
+            else:
+                script[frame].append([255, 230, 305, 270, 2, 2, 0.9])
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            video = base / "02_0300-0600_3배속.mp4"
+            self.make_video(video, frames=40)
+            config = default_config(str(base))
+            config.update({
+                "output_dir": str(base / "out"), "device": "cpu", "pixel_scale": 1.0,
+                "roi_polygon": [[20, 20], [620, 20], [620, 460], [20, 460]],
+                "counting_line": [[320, 150], [320, 420]], "save_event_images": False,
+                "id_stitch_enabled": False,
+            })
+            model = self.fake_model(script)
+            analyzer = BatchAnalyzer(config, base, log=lambda message: None, model_loader=lambda path: model)
+            summary, _ = analyzer.run(video_paths=[video])
+            rows = read_rows(summary)
+        self.assertEqual(rows[13], ["03:00~03:15", "0", "1", "1"])
 
     def test_legacy_single_line_pipeline(self):
         from two_way_counter import BatchAnalyzer
