@@ -26,6 +26,8 @@ from two_way_counter import (
     default_config,
     empty_counts,
     hidden_bottom_ratio,
+    rebuild_class_summary,
+    write_events,
     resolve_pixel_scale,
     write_gate_summary,
     write_movement_summary,
@@ -304,6 +306,25 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(od_rows[1], ["서", "0", "1", "0", "1", "2"])
 
 
+class ClassSummaryTests(unittest.TestCase):
+    def test_rebuild_class_summary_from_saved_records(self):
+        from two_way_counter import CountEvent
+
+        events = [
+            CountEvent("04_0900-1200_3배속.mp4", 1, 0.1, 9 * 3600 + 10, 36, "유입", 1, 2, "승용차", 0.9, 0, 0),
+            CountEvent("04_0900-1200_3배속.mp4", 2, 0.2, 9 * 3600 + 20, 36, "유출", 2, 7, "트럭", 0.9, 0, 0),
+            CountEvent("04_0900-1200_3배속.mp4", 3, 0.3, 9 * 3600 + 30, 36, "유입", 3, 3, "오토바이", 0.8, 0, 0),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            write_events(base / "차량별_통과기록.csv", events)
+            rows = read_rows(rebuild_class_summary(base, {"vehicle_classes": [2, 3, 5, 7]}))
+        self.assertEqual(rows[0], ["시간", "승용차 유입", "승용차 유출", "오토바이 유입", "오토바이 유출",
+                                   "버스 유입", "버스 유출", "트럭 유입", "트럭 유출", "유입 합계", "유출 합계"])
+        self.assertEqual(rows[37], ["09:00~09:15", "1", "0", "1", "0", "0", "0", "0", "1", "2", "1"])
+        self.assertEqual(rows[-1][-2:], ["2", "1"])
+
+
 class EndToEndTests(unittest.TestCase):
     """가짜 YOLO 모델로 영상 읽기부터 CSV·요약 저장까지 전체 경로를 검증한다."""
 
@@ -408,6 +429,7 @@ class EndToEndTests(unittest.TestCase):
             images = list((out / "event_images").glob("*.jpg"))
             review_exists = (out / "검수_01_0000-0300_3배속.mp4").exists()
             event_rows = read_dicts(events)
+            class_rows = read_rows(out / "15분_차종별_집계.csv")
         self.assertEqual(summary_rows[1], ["00:00~00:15", "3", "3", "6"])
         moves = sorted((row["출발"], row["도착"], row["회전"], row["상태"]) for row in trips)
         self.assertEqual(moves, [
@@ -419,6 +441,9 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(len(images), 6)
         self.assertTrue(review_exists)
         self.assertEqual({row["통과선"] for row in event_rows}, {"북", "동", "남", "서"})
+        self.assertEqual(class_rows[0][:3], ["시간", "승용차 유입", "승용차 유출"])
+        self.assertEqual(class_rows[-1][:3], ["합계", "3", "3"])
+        self.assertIn("차종별: 승용차 유입 3 유출 3", report)
 
     def test_occluded_fragment_box_is_not_counted(self):
         # 나가는 큰 차 뒤에 가려진 차의 박스(아래 변이 앞차에 가림)가 반대로 넘어가도 세지 않는다.

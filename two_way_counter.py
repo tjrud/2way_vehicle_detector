@@ -413,6 +413,67 @@ def write_video_results(
     return summary_path, events_path
 
 
+def class_order(config: dict, seen: Iterable[str] = ()) -> list[str]:
+    """차종 열 순서: 설정한 분석 대상 차종 순서, 그 뒤에 실제로 나온 기타 차종."""
+    names: list[str] = []
+    for value in config.get("vehicle_classes", VEHICLE_CLASSES):
+        name = CLASS_LABELS.get(int(value), "차량")
+        if name not in names:
+            names.append(name)
+    for name in seen:
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def write_class_summary(
+    path: Path,
+    class_counts: dict[int, dict[str, dict[str, int]]],
+    names: Sequence[str],
+) -> None:
+    """15분 구간마다 차종별 유입·유출을 저장한다. 마지막 행은 합계."""
+    totals = {name: {INBOUND: 0, OUTBOUND: 0} for name in names}
+    with path.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.writer(file)
+        header = ["시간"]
+        for name in names:
+            header += [f"{name} 유입", f"{name} 유출"]
+        writer.writerow(header + ["유입 합계", "유출 합계"])
+        for slot in range(96):
+            row: list[Any] = [slot_label(slot)]
+            slot_in = slot_out = 0
+            for name in names:
+                value = class_counts[slot].get(name, {INBOUND: 0, OUTBOUND: 0})
+                row += [value[INBOUND], value[OUTBOUND]]
+                totals[name][INBOUND] += value[INBOUND]
+                totals[name][OUTBOUND] += value[OUTBOUND]
+                slot_in += value[INBOUND]
+                slot_out += value[OUTBOUND]
+            writer.writerow(row + [slot_in, slot_out])
+        total_row: list[Any] = ["합계"]
+        for name in names:
+            total_row += [totals[name][INBOUND], totals[name][OUTBOUND]]
+        writer.writerow(total_row + [sum(v[INBOUND] for v in totals.values()), sum(v[OUTBOUND] for v in totals.values())])
+
+
+def rebuild_class_summary(output_dir: Path, config: dict | None = None) -> Path:
+    """이미 저장된 차량별_통과기록.csv로 15분_차종별_집계.csv를 다시 만든다(재분석 불필요)."""
+    class_counts: dict[int, dict[str, dict[str, int]]] = {slot: {} for slot in range(96)}
+    labels = {slot_label(slot): slot for slot in range(96)}
+    seen: list[str] = []
+    with (output_dir / "차량별_통과기록.csv").open("r", newline="", encoding="utf-8-sig") as file:
+        for row in csv.DictReader(file):
+            slot = labels[row["15분구간"]]
+            name = row["차종"] or "차량"
+            if name not in seen:
+                seen.append(name)
+            bucket = class_counts[slot].setdefault(name, {INBOUND: 0, OUTBOUND: 0})
+            bucket[row["방향"]] += 1
+    path = output_dir / "15분_차종별_집계.csv"
+    write_class_summary(path, class_counts, class_order(config or {}, seen))
+    return path
+
+
 def write_gate_summary(
     path: Path,
     gate_counts: dict[int, list[dict[str, int]]],
@@ -664,6 +725,8 @@ class BatchAnalyzer:
 
         counts = empty_counts()
         gate_counts = {slot: [{INBOUND: 0, OUTBOUND: 0} for _ in gates] for slot in range(96)}
+        class_counts: dict[int, dict[str, dict[str, int]]] = {slot: {} for slot in range(96)}
+        seen_classes: list[str] = []
         movement_counts: dict[int, dict[tuple[int | None, int | None], int]] = {slot: {} for slot in range(96)}
         movement_totals: dict[tuple[int | None, int | None], int] = {}
         events: list[CountEvent] = []
@@ -672,6 +735,7 @@ class BatchAnalyzer:
         summary_path = output_dir / "15분_유입유출_집계.csv"
         events_path = output_dir / "차량별_통과기록.csv" if save_detailed_records else None
         gate_summary_path = output_dir / "15분_접근로별_집계.csv"
+        class_summary_path = output_dir / "15분_차종별_집계.csv"
         movement_path = output_dir / "15분_방향별_집계.csv"
         od_path = output_dir / "OD_행렬.csv"
         trips_path = output_dir / "차량별_이동경로.csv"
@@ -718,6 +782,9 @@ class BatchAnalyzer:
             self.outputs = {"summary": str(summary_path)}
             if events_path is not None:
                 self.outputs["events"] = str(events_path)
+            class_names = class_order(self.config, seen_classes)
+            write_class_summary(class_summary_path, class_counts, class_names)
+            self.outputs["classes"] = str(class_summary_path)
             if len(gates) >= 2:
                 write_gate_summary(gate_summary_path, gate_counts, gates)
                 self.outputs["gates"] = str(gate_summary_path)
@@ -728,6 +795,13 @@ class BatchAnalyzer:
                 if save_detailed_records:
                     write_trips(trips_path, trip_records, gates)
                     self.outputs["trips"] = str(trips_path)
+            stats["classes"] = {
+                name: (
+                    sum(class_counts[s].get(name, {}).get(INBOUND, 0) for s in range(96)),
+                    sum(class_counts[s].get(name, {}).get(OUTBOUND, 0) for s in range(96)),
+                )
+                for name in class_names
+            }
             report = build_report(
                 self.config, gates, classifier, center, counts, gate_counts, movement_totals,
                 trip_mode, stats, time.monotonic() - started_at, device, track_options["half"],
@@ -874,6 +948,10 @@ class BatchAnalyzer:
                     counts[slot][direction] += 1
                     video_counts[slot][direction] += 1
                     gate_counts[slot][crossing.gate_index][direction] += 1
+                    class_name = CLASS_LABELS.get(class_id, "차량")
+                    if class_name not in seen_classes:
+                        seen_classes.append(class_name)
+                    class_counts[slot].setdefault(class_name, {INBOUND: 0, OUTBOUND: 0})[direction] += 1
                     event = CountEvent(
                         video=video.name,
                         frame=frame_index,
@@ -1008,6 +1086,9 @@ def build_report(
         ))
     else:
         lines.append(f"유입 방향: {screen_direction_text(gates[0])}")
+    class_totals = [(name, values) for name, values in (stats.get("classes") or {}).items() if sum(values)]
+    if class_totals:
+        lines.append("차종별: " + " | ".join(f"{name} 유입 {i} 유출 {o}" for name, (i, o) in class_totals))
     complete = no_exit = no_entry = 0
     if trip_mode:
         ranked = []
