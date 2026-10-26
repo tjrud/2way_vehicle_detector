@@ -167,6 +167,8 @@ class JobManager:
                 message="분석이 중지되었습니다." if stopped else "분석이 완료되었습니다.",
                 summary=read_summary(summary_path), summaryPath=str(summary_path),
                 eventsPath=str(events_path) if events_path is not None else None, completedAt=now_iso(),
+                reportPath=str(analyzer.report_path) if analyzer.report_path else None,
+                outputs=analyzer.outputs,
             )
             atomic_json(status_path, {
                 "updated_at": now_iso(), "status": status, "progress": progress_value / 100,
