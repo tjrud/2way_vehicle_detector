@@ -474,6 +474,44 @@ class EndToEndTests(unittest.TestCase):
             rows = read_rows(summary)
         self.assertEqual(rows[13], ["03:00~03:15", "0", "1", "1"])
 
+    def test_fp16_error_falls_back_to_fp32(self):
+        from unittest import mock
+
+        from two_way_counter import BatchAnalyzer
+
+        script: dict[int, list] = {}
+        self.add_vehicle(script, (1,), polyline([(150, 250), (500, 250)], 12), 0)
+        self.add_vehicle(script, (2,), polyline([(500, 300), (150, 300)], 12), 2)
+        inner = self.fake_model(script)
+
+        class HalfFailingModel:
+            predictor = None
+
+            def track(self, image, **options):
+                if options.get("half"):
+                    raise RuntimeError("half precision not supported")
+                return inner.track(image, **options)
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            video = base / "02_0300-0600_3배속.mp4"
+            self.make_video(video, frames=40)
+            config = default_config(str(base))
+            config.update({
+                "output_dir": str(base / "out"), "save_event_images": False,
+                "roi_polygon": [[20, 20], [620, 20], [620, 460], [20, 460]],
+                "counting_line": [[320, 150], [320, 420]],
+            })
+            logs: list[str] = []
+            analyzer = BatchAnalyzer(config, base, log=logs.append, model_loader=lambda path: HalfFailingModel())
+            with mock.patch.object(BatchAnalyzer, "_device", return_value=("0", True)):
+                summary, _ = analyzer.run(video_paths=[video])
+            rows = read_rows(summary)
+            report = (base / "out" / "분석요약.txt").read_text(encoding="utf-8-sig")
+        self.assertTrue(any("FP16 추론 오류로 FP32로 전환합니다" in line for line in logs))
+        self.assertIn("FP16→FP32 전환됨", report)
+        self.assertEqual(rows[13], ["03:00~03:15", "1", "1", "2"])
+
     def test_legacy_single_line_pipeline(self):
         from two_way_counter import BatchAnalyzer
 

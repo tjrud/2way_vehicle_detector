@@ -16,7 +16,7 @@ import queue
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence
@@ -639,6 +639,335 @@ def draw_gates(cv2: Any, image: Any, gates: Sequence[Gate], highlight: int | Non
         cv2.putText(image, gate.code, label_at, cv2.FONT_HERSHEY_SIMPLEX, max(0.5, 0.9 * scale), color, max(1, thickness - 1))
 
 
+@dataclass
+class TrackedBox:
+    """원본 영상 좌표로 복원한 추적 박스 하나."""
+
+    track_id: int
+    point: tuple[float, float]
+    class_id: int
+    confidence: float
+    box: tuple[float, float, float, float]
+
+
+@dataclass
+class VideoClock:
+    """영상 프레임 번호를 실제 시각(초)과 15분 구간으로 바꾼다."""
+
+    fps: float
+    start_seconds: float
+    speed_factor: float
+
+    def at(self, frame: int) -> tuple[float, float]:
+        """(영상 내 초, 자정을 순환하는 실제 시각 초)."""
+        video_seconds = frame / self.fps
+        return video_seconds, (self.start_seconds + video_seconds * self.speed_factor) % 86400
+
+    def slot(self, frame: int) -> int:
+        """프레임이 속한 0~95 15분 구간."""
+        return int(self.at(frame)[1] // 900)
+
+
+class RoiWindow:
+    """ROI 크롭 범위와 마스크. 추론은 잘라낸 좌표계로, 판정·기록은 원본 좌표로 한다."""
+
+    def __init__(
+        self,
+        cv2: Any,
+        np: Any,
+        roi_points: list[list[int]],
+        polygon: Any,
+        frame_width: int,
+        frame_height: int,
+        crop_enabled: bool,
+        padding_px: int,
+    ) -> None:
+        if crop_enabled:
+            self.left, self.top, self.right, self.bottom = roi_crop_bounds(frame_width, frame_height, roi_points, padding_px)
+        else:
+            self.left, self.top, self.right, self.bottom = 0, 0, frame_width, frame_height
+        shifted = polygon - np.array([self.left, self.top], dtype=np.int32)
+        mask = np.zeros((self.bottom - self.top, self.right - self.left), dtype=np.uint8)
+        cv2.fillPoly(mask, [shifted], 255)
+        self.mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        self.buffer = np.empty_like(self.mask_bgr)
+        self._cv2 = cv2
+
+    @property
+    def size_text(self) -> str:
+        return f"{self.right - self.left}x{self.bottom - self.top}"
+
+    def masked(self, frame: Any) -> Any:
+        """프레임을 ROI 범위로 자르고 ROI 밖을 검게 지운 재사용 버퍼를 반환한다."""
+        cropped = frame[self.top:self.bottom, self.left:self.right]
+        self._cv2.bitwise_and(cropped, self.mask_bgr, dst=self.buffer)
+        return self.buffer
+
+
+@dataclass
+class DetectionFilter:
+    """최소 크기, ROI 포함 여부, 앞차에 가려진 바닥점 기준으로 추적 박스를 거른다."""
+
+    roi_points: list[list[int]]
+    min_width: float
+    min_height: float
+    min_area: float
+    occluded_limit: float
+
+    @classmethod
+    def from_config(cls, config: dict, scale: float) -> "DetectionFilter":
+        return cls(
+            roi_points=config["roi_polygon"],
+            min_width=float(config.get("min_box_width_px", 35)) * scale,
+            min_height=float(config.get("min_box_height_px", 35)) * scale,
+            min_area=float(config.get("min_box_area_px", 2000)) * scale * scale,
+            occluded_limit=float(config.get("occluded_bottom_ratio", 0.5) or 0),
+        )
+
+    def tracked_boxes(self, rows: Iterable[Sequence[float]], window: RoiWindow) -> list[TrackedBox]:
+        """[x1, y1, x2, y2, id, cls, conf] 행을 원본 좌표 TrackedBox로 바꾸고 작은 박스·ROI 밖을 뺀다."""
+        boxes: list[TrackedBox] = []
+        for x1, y1, x2, y2, track_id, class_id, confidence in rows:
+            x1, y1, x2, y2 = map(float, (x1, y1, x2, y2))
+            if not box_meets_minimum_size((x1, y1, x2, y2), self.min_width, self.min_height, self.min_area):
+                continue
+            x1 += window.left
+            x2 += window.left
+            y1 += window.top
+            y2 += window.top
+            point = ((x1 + x2) / 2, y2)
+            if not point_in_polygon(point, self.roi_points):
+                continue
+            boxes.append(TrackedBox(int(track_id), point, int(class_id), float(confidence), (x1, y1, x2, y2)))
+        return boxes
+
+    def judged(self, boxes: list[TrackedBox]) -> list[TrackedBox]:
+        """통과 판정에 쓸 박스: 앞차가 아래 변을 가린 박스는 이 프레임에서 뺀다."""
+        if self.occluded_limit <= 0 or len(boxes) <= 1:
+            return boxes
+        rects = [item.box for item in boxes]
+        return [
+            item for index, item in enumerate(boxes)
+            if hidden_bottom_ratio(item.box, rects[:index] + rects[index + 1:]) < self.occluded_limit
+        ]
+
+
+class ResultBook:
+    """모든 영상에 걸친 집계를 누적하고 결과 파일과 요약을 쓴다."""
+
+    def __init__(
+        self,
+        config: dict,
+        gates: Sequence[Gate],
+        classifier: MovementClassifier,
+        center: tuple[float, float] | None,
+        output_dir: Path,
+        trip_mode: bool,
+    ) -> None:
+        self.config = config
+        self.gates = list(gates)
+        self.classifier = classifier
+        self.center = center
+        self.trip_mode = trip_mode
+        self.save_detailed = bool(config.get("save_detailed_records", True))
+        self.counts = empty_counts()
+        self.gate_counts = {slot: [{INBOUND: 0, OUTBOUND: 0} for _ in self.gates] for slot in range(96)}
+        self.class_counts: dict[int, dict[str, dict[str, int]]] = {slot: {} for slot in range(96)}
+        self.seen_classes: list[str] = []
+        self.movement_counts: dict[int, dict[tuple[int | None, int | None], int]] = {slot: {} for slot in range(96)}
+        self.movement_totals: dict[tuple[int | None, int | None], int] = {}
+        self.events: list[CountEvent] = []
+        self.trip_records: list[TripRecord] = []
+        self.stats: dict[str, Any] = {
+            "frames": 0, "recoveries": 0, "ignored": 0, "occluded": 0, "half_fallback": False, "videos": 0,
+        }
+        self.summary_path = output_dir / "15분_유입유출_집계.csv"
+        self.events_path = output_dir / "차량별_통과기록.csv" if self.save_detailed else None
+        self.gate_summary_path = output_dir / "15분_접근로별_집계.csv"
+        self.class_summary_path = output_dir / "15분_차종별_집계.csv"
+        self.movement_path = output_dir / "15분_방향별_집계.csv"
+        self.od_path = output_dir / "OD_행렬.csv"
+        self.trips_path = output_dir / "차량별_이동경로.csv"
+        self.report_path = output_dir / "분석요약.txt"
+
+    # ------------------------------------------------------------------ 누적
+    def add_crossing(self, event: CountEvent, gate_index: int) -> None:
+        """통과 한 건을 전체·통과선별·차종별 15분 집계와 상세 기록에 더한다."""
+        slot, direction = event.slot, event.direction
+        self.counts[slot][direction] += 1
+        self.gate_counts[slot][gate_index][direction] += 1
+        if event.class_name not in self.seen_classes:
+            self.seen_classes.append(event.class_name)
+        self.class_counts[slot].setdefault(event.class_name, {INBOUND: 0, OUTBOUND: 0})[direction] += 1
+        if self.save_detailed:
+            self.events.append(event)
+
+    def add_trip(self, video_name: str, trip: Trip, clock: VideoClock) -> None:
+        """마감된 이동 한 건을 진입 시각(없으면 진출 시각) 구간의 방향별 집계에 더한다."""
+        slot = clock.slot(max(0, trip.reference_frame))
+        key = (trip.entry_gate, trip.exit_gate)
+        self.movement_counts[slot][key] = self.movement_counts[slot].get(key, 0) + 1
+        self.movement_totals[key] = self.movement_totals.get(key, 0) + 1
+        if self.save_detailed:
+            self.trip_records.append(TripRecord(
+                video=video_name,
+                trip=trip,
+                movement=self.classifier.label(trip.entry_gate, trip.exit_gate),
+                class_name=CLASS_LABELS.get(trip.class_id, "차량") if trip.class_id is not None else "차량",
+                slot=slot,
+                entry_seconds=clock.at(trip.entry.frame)[1] if trip.entry is not None else None,
+                exit_seconds=clock.at(trip.exit.frame)[1] if trip.exit is not None else None,
+            ))
+
+    def add_counter_stats(self, counter: IntersectionCounter) -> None:
+        """판정기 하나가 끝날 때 재연결·무시 횟수를 누적한다."""
+        self.stats["recoveries"] += counter.recovery_count
+        self.stats["ignored"] += counter.ignored_crossings
+
+    # ------------------------------------------------------------------ 합계
+    def totals(self) -> tuple[int, int]:
+        return (
+            sum(item[INBOUND] for item in self.counts.values()),
+            sum(item[OUTBOUND] for item in self.counts.values()),
+        )
+
+    def gate_totals(self) -> list[tuple[int, int]]:
+        return [
+            (
+                sum(self.gate_counts[slot][index][INBOUND] for slot in range(96)),
+                sum(self.gate_counts[slot][index][OUTBOUND] for slot in range(96)),
+            )
+            for index in range(len(self.gates))
+        ]
+
+    def class_names(self) -> list[str]:
+        return class_order(self.config, self.seen_classes)
+
+    def class_totals(self) -> dict[str, tuple[int, int]]:
+        return {
+            name: (
+                sum(self.class_counts[slot].get(name, {}).get(INBOUND, 0) for slot in range(96)),
+                sum(self.class_counts[slot].get(name, {}).get(OUTBOUND, 0) for slot in range(96)),
+            )
+            for name in self.class_names()
+        }
+
+    # ------------------------------------------------------------------ 저장
+    def write_all(self, elapsed_seconds: float, device: str, half: bool, limit_seconds: float | None) -> dict[str, str]:
+        """지금까지의 전체 결과 파일과 요약을 쓰고 {종류: 경로}를 반환한다."""
+        write_summary(self.summary_path, self.counts)
+        outputs = {"summary": str(self.summary_path)}
+        if self.events_path is not None:
+            write_events(self.events_path, self.events)
+            outputs["events"] = str(self.events_path)
+        write_class_summary(self.class_summary_path, self.class_counts, self.class_names())
+        outputs["classes"] = str(self.class_summary_path)
+        if len(self.gates) >= 2:
+            write_gate_summary(self.gate_summary_path, self.gate_counts, self.gates)
+            outputs["gates"] = str(self.gate_summary_path)
+        if self.trip_mode:
+            write_movement_summary(self.movement_path, self.movement_counts, self.gates, self.classifier)
+            write_od_matrix(self.od_path, self.movement_totals, self.gates)
+            outputs.update({"movements": str(self.movement_path), "od": str(self.od_path)})
+            if self.save_detailed:
+                write_trips(self.trips_path, self.trip_records, self.gates)
+                outputs["trips"] = str(self.trips_path)
+        report = build_report(self, elapsed_seconds, device, half, limit_seconds)
+        self.report_path.write_text(report, encoding="utf-8-sig")
+        outputs["report"] = str(self.report_path)
+        return outputs
+
+
+class ReviewVideo:
+    """검수용 축소 영상. stride 프레임마다 ROI·통과선·박스·누적 수량을 그려 저장한다."""
+
+    def __init__(self, cv2: Any, np: Any, path: Path, fps: float, frame_width: int, frame_height: int, config: dict) -> None:
+        width = min(frame_width, int(config.get("review_width", 640)))
+        self.scale = width / frame_width
+        self.size = (width, round(frame_height * self.scale))
+        self.stride = max(1, int(config.get("review_stride", 3)))
+        self.writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps / self.stride, self.size)
+        self._cv2 = cv2
+        self._np = np
+
+    def write(
+        self,
+        frame_index: int,
+        frame: Any,
+        polygon: Any,
+        boxes: Sequence[TrackedBox],
+        crossing_by_id: dict[int, GateCrossing],
+        book: ResultBook,
+    ) -> None:
+        if frame_index % self.stride != 0:
+            return
+        cv2, np = self._cv2, self._np
+        small = cv2.resize(frame, self.size, interpolation=cv2.INTER_AREA)
+        cv2.polylines(small, [np.round(polygon * self.scale).astype(np.int32)], True, (0, 220, 255), 1)
+        draw_gates(cv2, small, book.gates, scale=self.scale)
+        for item in boxes:
+            crossing = crossing_by_id.get(item.track_id)
+            color = (200, 200, 200)
+            if crossing is not None:
+                color = direction_color(crossing.direction)
+            x1, y1, x2, y2 = item.box
+            p1 = (round(x1 * self.scale), round(y1 * self.scale))
+            p2 = (round(x2 * self.scale), round(y2 * self.scale))
+            cv2.rectangle(small, p1, p2, color, 2 if crossing is not None else 1)
+            cv2.putText(small, str(item.track_id), (p1[0], max(12, p1[1] - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        total_in, total_out = book.totals()
+        cv2.putText(small, f"IN {total_in} / OUT {total_out}", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (30, 255, 30), 2)
+        if len(book.gates) >= 2:
+            for index, (gate, (gate_in, gate_out)) in enumerate(zip(book.gates, book.gate_totals())):
+                cv2.putText(small, f"{gate.code} in {gate_in} out {gate_out}", (10, 46 + index * 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (30, 255, 30), 1)
+        self.writer.write(small)
+
+    def release(self) -> None:
+        self.writer.release()
+
+
+def direction_color(direction: str) -> tuple[int, int, int]:
+    """유입은 파랑, 유출은 주황(BGR)."""
+    return (255, 160, 40) if direction == INBOUND else (40, 130, 255)
+
+
+@dataclass
+class _RunContext:
+    """한 번의 분석 실행 동안 공유하는 모델·설정·누적 결과."""
+
+    cv2: Any
+    np: Any
+    torch: Any
+    output_dir: Path
+    event_image_dir: Path
+    gates: list[Gate]
+    polygon: Any
+    book: ResultBook
+    model: Any
+    model_path: str
+    device: str
+    track_options: dict[str, Any]
+    total_frames: int
+    started_at: float
+    limit_seconds: float | None
+    processed_frames: int = 0
+
+
+@dataclass
+class _VideoState:
+    """영상 하나를 분석하는 동안의 판정기·좌표 변환·영상별 결과."""
+
+    video: Path
+    clock: VideoClock
+    scale: float
+    counter: IntersectionCounter
+    window: RoiWindow
+    detections: DetectionFilter
+    review: ReviewVideo | None
+    counts: dict[int, dict[str, int]] = field(default_factory=empty_counts)
+    events: list[CountEvent] = field(default_factory=list)
+
+
 class BatchAnalyzer:
     """여러 MP4를 순차 분석하고 영상별·전체 결과를 지속적으로 저장한다."""
 
@@ -669,6 +998,54 @@ class BatchAnalyzer:
 
         return YOLO(model_path)
 
+    # ------------------------------------------------------------------ 실행 준비
+    def _output_dir(self) -> Path:
+        output_dir = Path(self.config.get("output_dir", "results"))
+        if not output_dir.is_absolute():
+            output_dir = self.config_dir / output_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if self.config.get("save_event_images", True):
+            (output_dir / "event_images").mkdir(parents=True, exist_ok=True)
+        return output_dir
+
+    def _videos(self, video_paths: list[Path] | None) -> list[Path]:
+        source_dir = Path(self.config["source_dir"])
+        videos = video_paths if video_paths is not None else sorted(source_dir.glob("*.mp4"))
+        if not videos:
+            raise FileNotFoundError(f"분석할 MP4 파일이 없습니다: {source_dir}")
+        return videos
+
+    def _device(self, torch: Any) -> tuple[str, bool]:
+        """요청 장치가 GPU인데 CUDA가 없으면 CPU로 바꾸고 FP16 사용 여부를 정한다."""
+        requested = str(self.config.get("device", "0"))
+        cuda_ready = torch is not None and torch.cuda.is_available()
+        device = requested if requested == "cpu" or cuda_ready else "cpu"
+        if device != requested:
+            self.log("GPU를 찾지 못해 CPU로 분석합니다. 매우 느릴 수 있습니다.")
+        return device, bool(self.config.get("half_precision", True)) and device != "cpu"
+
+    def _tracker_config(self) -> str:
+        tracker_config = str(self.config.get("tracker", "botsort_reid.yaml"))
+        tracker_path = Path(tracker_config)
+        if not tracker_path.is_absolute() and (self.config_dir / tracker_path).exists():
+            tracker_config = str(self.config_dir / tracker_path)
+        return tracker_config
+
+    @staticmethod
+    def _scan_videos(cv2: Any, videos: list[Path], limit_seconds: float | None) -> list[tuple[Path, int, float]]:
+        """전체 진행률 계산을 위해 영상별 처리 프레임 수와 fps를 먼저 읽는다."""
+        metadata: list[tuple[Path, int, float]] = []
+        for video in videos:
+            capture = cv2.VideoCapture(str(video))
+            frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
+            capture.release()
+            if limit_seconds is not None:
+                frames = min(frames, int(limit_seconds * fps))
+            metadata.append((video, frames, fps))
+        return metadata
+
+    # ------------------------------------------------------------------ 실행
     def run(
         self,
         limit_seconds: float | None = None,
@@ -684,18 +1061,8 @@ class BatchAnalyzer:
             torch = None
 
         started_at = time.monotonic()
-        source_dir = Path(self.config["source_dir"])
-        output_dir = Path(self.config.get("output_dir", "results"))
-        if not output_dir.is_absolute():
-            output_dir = self.config_dir / output_dir
-        output_dir.mkdir(parents=True, exist_ok=True)
-        event_image_dir = output_dir / "event_images"
-        if self.config.get("save_event_images", True):
-            event_image_dir.mkdir(parents=True, exist_ok=True)
-
-        videos = video_paths if video_paths is not None else sorted(source_dir.glob("*.mp4"))
-        if not videos:
-            raise FileNotFoundError(f"분석할 MP4 파일이 없습니다: {source_dir}")
+        output_dir = self._output_dir()
+        videos = self._videos(video_paths)
 
         gates = build_gates(self.config)
         roi_points = self.config["roi_polygon"]
@@ -708,377 +1075,246 @@ class BatchAnalyzer:
             + (" · 출발→도착 집계 사용" if trip_mode else "")
         )
 
-        requested_device = str(self.config.get("device", "0"))
-        cuda_ready = torch is not None and torch.cuda.is_available()
-        device = requested_device if requested_device == "cpu" or cuda_ready else "cpu"
-        if device != requested_device:
-            self.log("GPU를 찾지 못해 CPU로 분석합니다. 매우 느릴 수 있습니다.")
-        half = bool(self.config.get("half_precision", True)) and device != "cpu"
+        device, half = self._device(torch)
         model_path = str(self.config["model"])
         self.log(f"모델 불러오는 중: {model_path} / 장치: {device}{' / FP16' if half else ''}")
         model = self._load_model(model_path)
-        tracker_config = str(self.config.get("tracker", "botsort_reid.yaml"))
-        tracker_path = Path(tracker_config)
-        if not tracker_path.is_absolute() and (self.config_dir / tracker_path).exists():
-            tracker_config = str(self.config_dir / tracker_path)
+        tracker_config = self._tracker_config()
         self.log(f"추적기: {tracker_config}")
 
-        counts = empty_counts()
-        gate_counts = {slot: [{INBOUND: 0, OUTBOUND: 0} for _ in gates] for slot in range(96)}
-        class_counts: dict[int, dict[str, dict[str, int]]] = {slot: {} for slot in range(96)}
-        seen_classes: list[str] = []
-        movement_counts: dict[int, dict[tuple[int | None, int | None], int]] = {slot: {} for slot in range(96)}
-        movement_totals: dict[tuple[int | None, int | None], int] = {}
-        events: list[CountEvent] = []
-        trip_records: list[TripRecord] = []
-        save_detailed_records = bool(self.config.get("save_detailed_records", True))
-        summary_path = output_dir / "15분_유입유출_집계.csv"
-        events_path = output_dir / "차량별_통과기록.csv" if save_detailed_records else None
-        gate_summary_path = output_dir / "15분_접근로별_집계.csv"
-        class_summary_path = output_dir / "15분_차종별_집계.csv"
-        movement_path = output_dir / "15분_방향별_집계.csv"
-        od_path = output_dir / "OD_행렬.csv"
-        trips_path = output_dir / "차량별_이동경로.csv"
-        self.report_path = output_dir / "분석요약.txt"
-        stats = {"frames": 0, "recoveries": 0, "ignored": 0, "occluded": 0, "half_fallback": False, "videos": 0}
-        occluded_limit = float(self.config.get("occluded_bottom_ratio", 0.5) or 0)
-
-        # 먼저 전체 프레임 수를 계산해야 모든 영상에 걸친 진행률을 낼 수 있다.
-        metadata: list[tuple[Path, int, float]] = []
-        total_frames = 0
-        for video in videos:
-            cap = cv2.VideoCapture(str(video))
-            frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            cap.release()
-            if limit_seconds is not None:
-                frames = min(frames, int(limit_seconds * fps))
-            metadata.append((video, frames, fps))
-            total_frames += frames
-
-        processed_frames = 0
-        polygon = np.array(roi_points, dtype=np.int32)
-        classes = [int(value) for value in self.config.get("vehicle_classes", VEHICLE_CLASSES)]
-        speed_factor = float(self.config.get("speed_factor", 3.0))
-        roi_crop_enabled = bool(self.config.get("roi_crop_enabled", True))
-        frame_prefetch_buffer = int(self.config.get("frame_prefetch_buffer", 8))
-        track_options = {
-            "persist": True,
-            "tracker": tracker_config,
-            "conf": float(self.config.get("confidence", 0.22)),
-            "iou": float(self.config.get("iou", 0.65)),
-            "imgsz": int(self.config.get("image_size", 960)),
-            "classes": classes,
-            "device": device,
-            "half": half,
-            "verbose": False,
-        }
-
-        def write_all_outputs() -> None:
-            """완료된 영상까지의 전체 결과 파일을 갱신한다."""
-            write_summary(summary_path, counts)
-            if events_path is not None:
-                write_events(events_path, events)
-            self.outputs = {"summary": str(summary_path)}
-            if events_path is not None:
-                self.outputs["events"] = str(events_path)
-            class_names = class_order(self.config, seen_classes)
-            write_class_summary(class_summary_path, class_counts, class_names)
-            self.outputs["classes"] = str(class_summary_path)
-            if len(gates) >= 2:
-                write_gate_summary(gate_summary_path, gate_counts, gates)
-                self.outputs["gates"] = str(gate_summary_path)
-            if trip_mode:
-                write_movement_summary(movement_path, movement_counts, gates, classifier)
-                write_od_matrix(od_path, movement_totals, gates)
-                self.outputs.update({"movements": str(movement_path), "od": str(od_path)})
-                if save_detailed_records:
-                    write_trips(trips_path, trip_records, gates)
-                    self.outputs["trips"] = str(trips_path)
-            stats["classes"] = {
-                name: (
-                    sum(class_counts[s].get(name, {}).get(INBOUND, 0) for s in range(96)),
-                    sum(class_counts[s].get(name, {}).get(OUTBOUND, 0) for s in range(96)),
-                )
-                for name in class_names
-            }
-            report = build_report(
-                self.config, gates, classifier, center, counts, gate_counts, movement_totals,
-                trip_mode, stats, time.monotonic() - started_at, device, track_options["half"],
-                limit_seconds,
-            )
-            self.report_path.write_text(report, encoding="utf-8-sig")
-            self.outputs["report"] = str(self.report_path)
+        book = ResultBook(self.config, gates, classifier, center, output_dir, trip_mode)
+        self.report_path = book.report_path
+        metadata = self._scan_videos(cv2, videos, limit_seconds)
+        run = _RunContext(
+            cv2=cv2,
+            np=np,
+            torch=torch,
+            output_dir=output_dir,
+            event_image_dir=output_dir / "event_images",
+            gates=gates,
+            polygon=np.array(roi_points, dtype=np.int32),
+            book=book,
+            model=model,
+            model_path=model_path,
+            device=device,
+            track_options={
+                "persist": True,
+                "tracker": tracker_config,
+                "conf": float(self.config.get("confidence", 0.22)),
+                "iou": float(self.config.get("iou", 0.65)),
+                "imgsz": int(self.config.get("image_size", 960)),
+                "classes": [int(value) for value in self.config.get("vehicle_classes", VEHICLE_CLASSES)],
+                "device": device,
+                "half": half,
+                "verbose": False,
+            },
+            total_frames=sum(frames for _, frames, _ in metadata),
+            started_at=started_at,
+            limit_seconds=limit_seconds,
+        )
 
         for video_index, (video, expected_frames, fps) in enumerate(metadata, start=1):
             if self.stop_event.is_set():
                 break
-            self.log(f"[{video_index}/{len(videos)}] {video.name} 분석 시작")
-            if reset_model_tracking_state(model):
-                self.log("  영상 전환: 추적기 상태 초기화")
-            video_counts = empty_counts()
-            video_events: list[CountEvent] = []
-            start_seconds = video_start_seconds(video.name)
-            cap = cv2.VideoCapture(str(video))
-            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            scale = resolve_pixel_scale(self.config, frame_height)
-            counter = build_counter(self.config, gates, scale)
-            min_box_width = float(self.config.get("min_box_width_px", 35)) * scale
-            min_box_height = float(self.config.get("min_box_height_px", 35)) * scale
-            min_box_area = float(self.config.get("min_box_area_px", 2000)) * scale * scale
-            if roi_crop_enabled:
-                crop_left, crop_top, crop_right, crop_bottom = roi_crop_bounds(
-                    frame_width,
-                    frame_height,
-                    roi_points,
-                    round(int(self.config.get("roi_crop_padding_px", 64)) * scale),
-                )
-            else:
-                crop_left, crop_top, crop_right, crop_bottom = 0, 0, frame_width, frame_height
-            # 추론에는 잘라낸 좌표계를 쓰되 통과 판정과 결과 기록은 원본 좌표로 복원한다.
-            shifted_polygon = polygon - np.array([crop_left, crop_top], dtype=np.int32)
-            roi_mask = np.zeros((crop_bottom - crop_top, crop_right - crop_left), dtype=np.uint8)
-            cv2.fillPoly(roi_mask, [shifted_polygon], 255)
-            roi_mask_bgr = cv2.cvtColor(roi_mask, cv2.COLOR_GRAY2BGR)
-            masked_buffer = np.empty_like(roi_mask_bgr)
-            self.log(
-                f"  ROI 크롭: {crop_right - crop_left}x{crop_bottom - crop_top} "
-                f"(원본 {frame_width}x{frame_height}, 화면 배율 {scale:.2f})"
-            )
-            writer = None
-            review_size: tuple[int, int] | None = None
-            review_scale = 1.0
-            review_stride = max(1, int(self.config.get("review_stride", 3)))
-            if self.config.get("save_review_video", False):
-                review_width = min(frame_width, int(self.config.get("review_width", 640)))
-                review_scale = review_width / frame_width
-                review_size = (review_width, round(frame_height * review_scale))
-                review_path = output_dir / f"검수_{video.stem}.mp4"
-                writer = cv2.VideoWriter(str(review_path), cv2.VideoWriter_fourcc(*"mp4v"), fps / review_stride, review_size)
+            self._analyze_video(run, f"{video_index}/{len(videos)}", video, expected_frames, fps)
 
-            def real_time_of(frame_number: int) -> tuple[float, float]:
-                video_seconds = frame_number / fps
-                return video_seconds, (start_seconds + video_seconds * speed_factor) % 86400
-
-            def record_trips(trips: Iterable[Trip]) -> None:
-                for trip in trips:
-                    reference = trip.reference_frame
-                    _, reference_seconds = real_time_of(max(0, reference))
-                    slot = int(reference_seconds // 900)
-                    key = (trip.entry_gate, trip.exit_gate)
-                    movement_counts[slot][key] = movement_counts[slot].get(key, 0) + 1
-                    movement_totals[key] = movement_totals.get(key, 0) + 1
-                    if save_detailed_records:
-                        trip_records.append(TripRecord(
-                            video=video.name,
-                            trip=trip,
-                            movement=classifier.label(trip.entry_gate, trip.exit_gate),
-                            class_name=CLASS_LABELS.get(trip.class_id, "차량") if trip.class_id is not None else "차량",
-                            slot=slot,
-                            entry_seconds=real_time_of(trip.entry.frame)[1] if trip.entry is not None else None,
-                            exit_seconds=real_time_of(trip.exit.frame)[1] if trip.exit is not None else None,
-                        ))
-
-            frame_index = 0
-            video_started = time.monotonic()
-            prefetcher = FramePrefetcher(cap, expected_frames, frame_prefetch_buffer, self.stop_event)
-            for frame in prefetcher:
-                if self.stop_event.is_set():
-                    break
-                cropped = frame[crop_top:crop_bottom, crop_left:crop_right]
-                cv2.bitwise_and(cropped, roi_mask_bgr, dst=masked_buffer)
-                try:
-                    result = model.track(masked_buffer, **track_options)[0]
-                except Exception as error:
-                    if not track_options["half"]:
-                        raise
-                    # FP16 문제가 나면 모델을 FP32로 다시 만들고 판정기도 새로 시작한다.
-                    self.log(f"  FP16 추론 오류로 FP32로 전환합니다: {error}")
-                    track_options["half"] = False
-                    stats["half_fallback"] = True
-                    model = self._load_model(model_path)
-                    record_trips(counter.finish())
-                    stats["recoveries"] += counter.recovery_count
-                    stats["ignored"] += counter.ignored_crossings
-                    counter = build_counter(self.config, gates, scale)
-                    result = model.track(masked_buffer, **track_options)[0]
-
-                track_details: list[tuple[int, tuple[float, float], int, float, tuple[float, float, float, float]]] = []
-                for x1, y1, x2, y2, track_id_value, class_id_value, confidence_value in extract_box_rows(result.boxes, torch):
-                    x1, y1, x2, y2 = map(float, (x1, y1, x2, y2))
-                    if not box_meets_minimum_size((x1, y1, x2, y2), min_box_width, min_box_height, min_box_area):
-                        continue
-                    x1 += crop_left
-                    x2 += crop_left
-                    y1 += crop_top
-                    y2 += crop_top
-                    point = ((x1 + x2) / 2, y2)
-                    if not point_in_polygon(point, roi_points):
-                        continue
-                    track_details.append((int(track_id_value), point, int(class_id_value), float(confidence_value), (x1, y1, x2, y2)))
-
-                # 한 프레임의 모든 ID를 함께 전달해야 동시 가림을 일대일로 연결할 수 있다.
-                # 차량이 없는 프레임도 전달해야 사라진 ID가 제때 정리된다.
-                judged = track_details
-                if occluded_limit > 0 and len(track_details) > 1:
-                    boxes = [item[4] for item in track_details]
-                    judged = [
-                        item for index, item in enumerate(track_details)
-                        if hidden_bottom_ratio(item[4], boxes[:index] + boxes[index + 1:]) < occluded_limit
-                    ]
-                    stats["occluded"] += len(track_details) - len(judged)
-                crossings = counter.process_frame(
-                    [(track_id, point, class_id, confidence) for track_id, point, class_id, confidence, _ in judged],
-                    frame_index,
-                )
-                for new_id, old_id in counter.last_recoveries.items():
-                    self.log(f"  가림 ID 연결: {old_id} → {new_id}")
-
-                details_by_id = {item[0]: item for item in track_details}
-                crossing_by_id: dict[int, GateCrossing] = {}
-                for crossing in crossings:
-                    crossing_by_id[crossing.track_id] = crossing
-                    gate = gates[crossing.gate_index]
-                    direction = crossing.direction
-                    _, point, observed_class, confidence, (x1, y1, x2, y2) = details_by_id[crossing.track_id]
-                    class_id = crossing.class_id if crossing.class_id is not None else observed_class
-                    video_seconds, real_seconds = real_time_of(frame_index)
-                    slot = int(real_seconds // 900)
-                    counts[slot][direction] += 1
-                    video_counts[slot][direction] += 1
-                    gate_counts[slot][crossing.gate_index][direction] += 1
-                    class_name = CLASS_LABELS.get(class_id, "차량")
-                    if class_name not in seen_classes:
-                        seen_classes.append(class_name)
-                    class_counts[slot].setdefault(class_name, {INBOUND: 0, OUTBOUND: 0})[direction] += 1
-                    event = CountEvent(
-                        video=video.name,
-                        frame=frame_index,
-                        video_seconds=video_seconds,
-                        real_seconds=real_seconds,
-                        slot=slot,
-                        direction=direction,
-                        track_id=crossing.track_id,
-                        class_id=class_id,
-                        class_name=CLASS_LABELS.get(class_id, "차량"),
-                        confidence=confidence,
-                        point_x=point[0],
-                        point_y=point[1],
-                        gate_code=gate.code,
-                        gate_name=gate.name,
-                    )
-                    if save_detailed_records:
-                        events.append(event)
-                        video_events.append(event)
-                    gate_text = f" [{gate.name}]" if len(gates) >= 2 else ""
-                    self.log(f"  {event.real_time}{gate_text} {direction} {event.class_name} (ID {crossing.track_id})")
-                    if self.config.get("save_event_images", True):
-                        snapshot = frame.copy()
-                        cv2.polylines(snapshot, [polygon], True, (0, 220, 255), 2)
-                        draw_gates(cv2, snapshot, gates, highlight=crossing.gate_index)
-                        color = (255, 160, 40) if direction == INBOUND else (40, 130, 255)
-                        cv2.rectangle(snapshot, (int(x1), int(y1)), (int(x2), int(y2)), color, 3)
-                        gate_part = f"_{gate.code}" if len(gates) >= 2 else ""
-                        image_name = f"{event.real_time.replace(':', '')}{gate_part}_{direction}_ID{crossing.track_id}_{video.stem}.jpg"
-                        cv2.imwrite(str(event_image_dir / image_name), snapshot)
-
-                record_trips(counter.drain_trips())
-
-                if writer is not None and frame_index % review_stride == 0 and review_size is not None:
-                    small = cv2.resize(frame, review_size, interpolation=cv2.INTER_AREA)
-                    cv2.polylines(small, [np.round(polygon * review_scale).astype(np.int32)], True, (0, 220, 255), 1)
-                    draw_gates(cv2, small, gates, scale=review_scale)
-                    for track_id, _, _, _, (x1, y1, x2, y2) in track_details:
-                        crossing = crossing_by_id.get(track_id)
-                        color = (200, 200, 200)
-                        if crossing is not None:
-                            color = (255, 160, 40) if crossing.direction == INBOUND else (40, 130, 255)
-                        p1 = (round(x1 * review_scale), round(y1 * review_scale))
-                        p2 = (round(x2 * review_scale), round(y2 * review_scale))
-                        cv2.rectangle(small, p1, p2, color, 2 if crossing is not None else 1)
-                        cv2.putText(small, str(track_id), (p1[0], max(12, p1[1] - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-                    total_in = sum(item[INBOUND] for item in counts.values())
-                    total_out = sum(item[OUTBOUND] for item in counts.values())
-                    cv2.putText(small, f"IN {total_in} / OUT {total_out}", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (30, 255, 30), 2)
-                    if len(gates) >= 2:
-                        for index, gate in enumerate(gates):
-                            gate_in = sum(gate_counts[s][index][INBOUND] for s in range(96))
-                            gate_out = sum(gate_counts[s][index][OUTBOUND] for s in range(96))
-                            cv2.putText(small, f"{gate.code} in {gate_in} out {gate_out}", (10, 46 + index * 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (30, 255, 30), 1)
-                    writer.write(small)
-
-                frame_index += 1
-                processed_frames += 1
-                if frame_index % 120 == 0:
-                    self.progress(processed_frames / max(total_frames, 1))
-
-            prefetcher.close()
-            record_trips(counter.finish())
-            stats["recoveries"] += counter.recovery_count
-            stats["ignored"] += counter.ignored_crossings
-            stats["frames"] += frame_index
-            stats["videos"] += 1
-            if writer is not None:
-                writer.release()
-            video_summary_path, video_events_path = write_video_results(
-                output_dir,
-                video,
-                video_counts,
-                video_events,
-                save_detailed_records=save_detailed_records,
-            )
-            # 영상 하나가 끝날 때마다 전체 결과 파일을 갱신한다.
-            write_all_outputs()
-            if video_events_path is not None:
-                self.log(f"  영상별 CSV 저장: {video_summary_path.name}, {video_events_path.name}")
-            else:
-                self.log(f"  영상별 집계 CSV 저장: {video_summary_path.name}")
-            elapsed = max(1e-6, time.monotonic() - video_started)
-            self.log(f"[{video_index}/{len(videos)}] 완료: {frame_index:,} 프레임 · {frame_index / elapsed:.1f} fps")
-
-        write_all_outputs()
-        self.progress(1.0 if not self.stop_event.is_set() else processed_frames / max(total_frames, 1))
-        self.log(
-            f"완료: 유입 {sum(item[INBOUND] for item in counts.values()):,}대 / "
-            f"유출 {sum(item[OUTBOUND] for item in counts.values()):,}대"
-        )
+        self._write_outputs(run)
+        self.progress(1.0 if not self.stop_event.is_set() else run.processed_frames / max(run.total_frames, 1))
+        total_in, total_out = book.totals()
+        self.log(f"완료: 유입 {total_in:,}대 / 유출 {total_out:,}대")
         self.log(f"요약: {self.report_path}")
-        return summary_path, events_path
+        return book.summary_path, book.events_path
+
+    def _write_outputs(self, run: _RunContext) -> None:
+        """완료된 영상까지의 전체 결과 파일과 요약을 갱신한다."""
+        self.outputs = run.book.write_all(
+            time.monotonic() - run.started_at, run.device, run.track_options["half"], run.limit_seconds,
+        )
+
+    def _open_video(self, run: _RunContext, video: Path, fps: float) -> tuple[Any, _VideoState]:
+        """영상을 열고 해상도에 맞춘 판정기·ROI 크롭·박스 필터·검수 영상을 준비한다."""
+        cv2, np = run.cv2, run.np
+        clock = VideoClock(fps, video_start_seconds(video.name), float(self.config.get("speed_factor", 3.0)))
+        capture = cv2.VideoCapture(str(video))
+        frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        scale = resolve_pixel_scale(self.config, frame_height)
+        counter = build_counter(self.config, run.gates, scale)
+        window = RoiWindow(
+            cv2, np, self.config["roi_polygon"], run.polygon, frame_width, frame_height,
+            bool(self.config.get("roi_crop_enabled", True)),
+            round(int(self.config.get("roi_crop_padding_px", 64)) * scale),
+        )
+        self.log(f"  ROI 크롭: {window.size_text} (원본 {frame_width}x{frame_height}, 화면 배율 {scale:.2f})")
+        review = None
+        if self.config.get("save_review_video", False):
+            review = ReviewVideo(cv2, np, run.output_dir / f"검수_{video.stem}.mp4", fps, frame_width, frame_height, self.config)
+        state = _VideoState(
+            video=video,
+            clock=clock,
+            scale=scale,
+            counter=counter,
+            window=window,
+            detections=DetectionFilter.from_config(self.config, scale),
+            review=review,
+        )
+        return capture, state
+
+    def _analyze_video(self, run: _RunContext, position: str, video: Path, expected_frames: int, fps: float) -> None:
+        """영상 하나를 프레임 단위로 추적·판정하고 영상별·전체 결과를 저장한다."""
+        self.log(f"[{position}] {video.name} 분석 시작")
+        if reset_model_tracking_state(run.model):
+            self.log("  영상 전환: 추적기 상태 초기화")
+        capture, state = self._open_video(run, video, fps)
+
+        frame_index = 0
+        video_started = time.monotonic()
+        prefetcher = FramePrefetcher(capture, expected_frames, int(self.config.get("frame_prefetch_buffer", 8)), self.stop_event)
+        for frame in prefetcher:
+            if self.stop_event.is_set():
+                break
+            self._process_frame(run, state, frame, frame_index)
+            frame_index += 1
+            run.processed_frames += 1
+            if frame_index % 120 == 0:
+                self.progress(run.processed_frames / max(run.total_frames, 1))
+
+        prefetcher.close()
+        for trip in state.counter.finish():
+            run.book.add_trip(video.name, trip, state.clock)
+        run.book.add_counter_stats(state.counter)
+        run.book.stats["frames"] += frame_index
+        run.book.stats["videos"] += 1
+        if state.review is not None:
+            state.review.release()
+        video_summary_path, video_events_path = write_video_results(
+            run.output_dir, video, state.counts, state.events, save_detailed_records=run.book.save_detailed,
+        )
+        # 영상 하나가 끝날 때마다 전체 결과 파일을 갱신한다.
+        self._write_outputs(run)
+        if video_events_path is not None:
+            self.log(f"  영상별 CSV 저장: {video_summary_path.name}, {video_events_path.name}")
+        else:
+            self.log(f"  영상별 집계 CSV 저장: {video_summary_path.name}")
+        elapsed = max(1e-6, time.monotonic() - video_started)
+        self.log(f"[{position}] 완료: {frame_index:,} 프레임 · {frame_index / elapsed:.1f} fps")
+
+    def _process_frame(self, run: _RunContext, state: _VideoState, frame: Any, frame_index: int) -> None:
+        """한 프레임: 추적 → 박스 필터 → 통과 판정 → 기록·이미지 → 이동 마감 → 검수 영상."""
+        result = self._track(run, state, state.window.masked(frame))
+        boxes = state.detections.tracked_boxes(extract_box_rows(result.boxes, run.torch), state.window)
+        judged = state.detections.judged(boxes)
+        run.book.stats["occluded"] += len(boxes) - len(judged)
+        # 한 프레임의 모든 ID를 함께 전달해야 동시 가림을 일대일로 연결할 수 있다.
+        # 차량이 없는 프레임도 전달해야 사라진 ID가 제때 정리된다.
+        crossings = state.counter.process_frame(
+            [(item.track_id, item.point, item.class_id, item.confidence) for item in judged],
+            frame_index,
+        )
+        for new_id, old_id in state.counter.last_recoveries.items():
+            self.log(f"  가림 ID 연결: {old_id} → {new_id}")
+
+        boxes_by_id = {item.track_id: item for item in boxes}
+        crossing_by_id: dict[int, GateCrossing] = {}
+        for crossing in crossings:
+            crossing_by_id[crossing.track_id] = crossing
+            self._record_crossing(run, state, frame, frame_index, crossing, boxes_by_id[crossing.track_id])
+        for trip in state.counter.drain_trips():
+            run.book.add_trip(state.video.name, trip, state.clock)
+        if state.review is not None:
+            state.review.write(frame_index, frame, run.polygon, boxes, crossing_by_id, run.book)
+
+    def _track(self, run: _RunContext, state: _VideoState, image: Any) -> Any:
+        """YOLO 추적을 실행한다. FP16 오류가 나면 FP32 모델과 새 판정기로 한 번 다시 시도한다."""
+        try:
+            return run.model.track(image, **run.track_options)[0]
+        except Exception as error:
+            if not run.track_options["half"]:
+                raise
+            self.log(f"  FP16 추론 오류로 FP32로 전환합니다: {error}")
+            run.track_options["half"] = False
+            run.book.stats["half_fallback"] = True
+            run.model = self._load_model(run.model_path)
+            for trip in state.counter.finish():
+                run.book.add_trip(state.video.name, trip, state.clock)
+            run.book.add_counter_stats(state.counter)
+            state.counter = build_counter(self.config, run.gates, state.scale)
+            return run.model.track(image, **run.track_options)[0]
+
+    def _record_crossing(
+        self,
+        run: _RunContext,
+        state: _VideoState,
+        frame: Any,
+        frame_index: int,
+        crossing: GateCrossing,
+        box: TrackedBox,
+    ) -> None:
+        """통과 한 건을 집계·로그·통과 순간 이미지로 남긴다."""
+        gate = run.gates[crossing.gate_index]
+        class_id = crossing.class_id if crossing.class_id is not None else box.class_id
+        video_seconds, real_seconds = state.clock.at(frame_index)
+        event = CountEvent(
+            video=state.video.name,
+            frame=frame_index,
+            video_seconds=video_seconds,
+            real_seconds=real_seconds,
+            slot=int(real_seconds // 900),
+            direction=crossing.direction,
+            track_id=crossing.track_id,
+            class_id=class_id,
+            class_name=CLASS_LABELS.get(class_id, "차량"),
+            confidence=box.confidence,
+            point_x=box.point[0],
+            point_y=box.point[1],
+            gate_code=gate.code,
+            gate_name=gate.name,
+        )
+        state.counts[event.slot][event.direction] += 1
+        if run.book.save_detailed:
+            state.events.append(event)
+        run.book.add_crossing(event, crossing.gate_index)
+        gate_text = f" [{gate.name}]" if len(run.gates) >= 2 else ""
+        self.log(f"  {event.real_time}{gate_text} {event.direction} {event.class_name} (ID {crossing.track_id})")
+        if self.config.get("save_event_images", True):
+            self._save_snapshot(run, frame, event, crossing.gate_index, box)
+
+    @staticmethod
+    def _save_snapshot(run: _RunContext, frame: Any, event: CountEvent, gate_index: int, box: TrackedBox) -> None:
+        """통과 순간 원본 프레임에 ROI·통과선·차량 박스를 그려 저장한다."""
+        cv2 = run.cv2
+        snapshot = frame.copy()
+        cv2.polylines(snapshot, [run.polygon], True, (0, 220, 255), 2)
+        draw_gates(cv2, snapshot, run.gates, highlight=gate_index)
+        x1, y1, x2, y2 = box.box
+        cv2.rectangle(snapshot, (int(x1), int(y1)), (int(x2), int(y2)), direction_color(event.direction), 3)
+        gate_part = f"_{event.gate_code}" if len(run.gates) >= 2 else ""
+        stem = Path(event.video).stem
+        image_name = f"{event.real_time.replace(':', '')}{gate_part}_{event.direction}_ID{event.track_id}_{stem}.jpg"
+        cv2.imwrite(str(run.event_image_dir / image_name), snapshot)
 
 
 def build_report(
-    config: dict,
-    gates: Sequence[Gate],
-    classifier: MovementClassifier,
-    center: tuple[float, float] | None,
-    counts: dict[int, dict[str, int]],
-    gate_counts: dict[int, list[dict[str, int]]],
-    movement_totals: dict[tuple[int | None, int | None], int],
-    trip_mode: bool,
-    stats: dict[str, Any],
+    book: ResultBook,
     elapsed_seconds: float,
     device: str,
     half: bool,
     limit_seconds: float | None,
 ) -> str:
     """사람과 Claude가 짧게 읽을 수 있는 분석 요약과 점검 항목을 만든다."""
-    total_in = sum(item[INBOUND] for item in counts.values())
-    total_out = sum(item[OUTBOUND] for item in counts.values())
+    config, gates, stats = book.config, book.gates, book.stats
+    total_in, total_out = book.totals()
     fps = stats["frames"] / elapsed_seconds if elapsed_seconds > 0 else 0.0
     minutes, seconds = divmod(int(elapsed_seconds), 60)
+    shape = str(config.get("intersection_type") or ("2way" if len(gates) == 1 else "custom"))
     lines = [
         f"분석 요약 · {datetime.now().strftime('%Y-%m-%d %H:%M')}" + (" · 시험 분석" if limit_seconds else ""),
-        f"설정: {INTERSECTION_TYPES.get(str(config.get('intersection_type') or ('2way' if len(gates) == 1 else 'custom')), '사용자 지정')} · 통과선 {len(gates)}개 · "
+        f"설정: {INTERSECTION_TYPES.get(shape, '사용자 지정')} · 통과선 {len(gates)}개 · "
         f"모델 {config.get('model')} · 장치 {device}{' FP16' if half else ''} · 입력 {config.get('image_size', 960)}px",
         f"처리: 영상 {stats['videos']}개 · {stats['frames']:,}프레임 · {fps:.1f} fps · {minutes}분 {seconds}초",
         f"합계: 유입 {total_in:,} / 유출 {total_out:,}",
     ]
-    gate_totals = []
-    for index, gate in enumerate(gates):
-        gate_in = sum(gate_counts[slot][index][INBOUND] for slot in range(96))
-        gate_out = sum(gate_counts[slot][index][OUTBOUND] for slot in range(96))
-        gate_totals.append((gate_in, gate_out))
+    gate_totals = book.gate_totals()
     if len(gates) >= 2:
         lines.append("통과선별: " + " | ".join(
             f"{gate.code}({gate.name}) 유입 {gate_in} 유출 {gate_out}"
@@ -1086,13 +1322,13 @@ def build_report(
         ))
     else:
         lines.append(f"유입 방향: {screen_direction_text(gates[0])}")
-    class_totals = [(name, values) for name, values in (stats.get("classes") or {}).items() if sum(values)]
+    class_totals = [(name, values) for name, values in book.class_totals().items() if sum(values)]
     if class_totals:
         lines.append("차종별: " + " | ".join(f"{name} 유입 {i} 유출 {o}" for name, (i, o) in class_totals))
     complete = no_exit = no_entry = 0
-    if trip_mode:
+    if book.trip_mode:
         ranked = []
-        for (entry, exit_), value in movement_totals.items():
+        for (entry, exit_), value in book.movement_totals.items():
             if entry is not None and exit_ is not None:
                 complete += value
                 ranked.append((value, entry, exit_))
@@ -1103,7 +1339,7 @@ def build_report(
         ranked.sort(reverse=True)
         if ranked:
             lines.append(f"방향별 상위(완료 {complete}건): " + ", ".join(
-                f"{gates[entry].name}→{gates[exit_].name} {classifier.label(entry, exit_)} {value}"
+                f"{gates[entry].name}→{gates[exit_].name} {book.classifier.label(entry, exit_)} {value}"
                 for value, entry, exit_ in ranked[:8]
             ))
         all_trips = complete + no_exit + no_entry
@@ -1122,9 +1358,9 @@ def build_report(
         for gate, (gate_in, gate_out) in zip(gates, gate_totals):
             if busiest >= 10 and gate_in + gate_out == 0:
                 warnings.append(f"통과선 {gate.code}({gate.name})에서 집계가 없습니다. 위치·ROI 포함 여부를 확인하세요.")
-            if center is not None and side_of(gate.a, gate.b, center) not in (0, gate.inside_side):
+            if book.center is not None and side_of(gate.a, gate.b, book.center) not in (0, gate.inside_side):
                 warnings.append(f"통과선 {gate.code}({gate.name})의 유입 화살표가 교차로 중심 반대쪽입니다. 의도한 설정인지 확인하세요.")
-    if trip_mode and complete + no_exit + no_entry >= 10:
+    if book.trip_mode and complete + no_exit + no_entry >= 10:
         if (no_exit + no_entry) / (complete + no_exit + no_entry) > 0.3:
             warnings.append("미확인 이동이 30%를 넘습니다. ROI가 통과선 바깥 도로까지 충분히 덮는지, 통과선이 교차로 입구에 있는지 확인하세요.")
     if device != "cpu" and stats["frames"] >= 1000 and fps < 12:
